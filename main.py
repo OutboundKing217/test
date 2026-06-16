@@ -80,8 +80,11 @@ async def create_session(body: CreateSessionRequest):
     except ValueError: raise HTTPException(400, "Invalid user_id format")
 
     async with AsyncSessionLocal() as db:
-        user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
-        if user is None: raise HTTPException(404, "User not found")
+           user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
+        if user is None:
+            user = User(id=user_uuid, created_at=datetime.now(timezone.utc))
+            db.add(user)
+            await db.flush()
 
         try: started_at_dt = datetime.fromisoformat(body.started_at.replace("Z", "+00:00"))
         except ValueError: raise HTTPException(400, "Invalid started_at format")
