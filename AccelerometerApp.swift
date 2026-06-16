@@ -4,7 +4,7 @@ import CoreMotion
 import Charts
 
 // MARK: - Replace with your Railway deployment URL before running
-private let baseURL = "https://your-app.railway.app"
+private let baseURL = "https://web-production-8cb5b.up.railway.app"
 
 // MARK: - Data Models
 
