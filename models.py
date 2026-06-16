@@ -9,7 +9,7 @@ class Base(DeclarativeBase): pass
 class User(Base):
     __tablename__ = "users"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     sessions = relationship("Session", back_populates="user", lazy="select")
 
 class Session(Base):
