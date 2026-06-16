@@ -105,7 +105,7 @@ async def create_session(body: CreateSessionRequest):
         await db.flush()
 
         analysis_out = None
-        if len(samples_list) >= 16:
+        if len(samples_list) >= 64:
             try:
                 results = analyze_samples(samples_list)
                 analysis = Analysis(
