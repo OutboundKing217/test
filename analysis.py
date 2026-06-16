@@ -7,7 +7,7 @@ SAMPLE_RATE_HZ = 30
 
 def compute_psd(signal_1d, fs):
     nperseg = min(256, len(signal_1d) // 4)
-    if nperseg < 4: nperseg = max(4, len(signal_1d) // 2)
+    nperseg = max(nperseg, 16)
     freqs, power = signal.welch(signal_1d, fs=fs, nperseg=nperseg, scaling="density")
     mask = freqs > 0
     return freqs[mask], power[mask]
