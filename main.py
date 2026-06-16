@@ -76,18 +76,22 @@ async def create_user():
 
 @app.post("/sessions", response_model=CreateSessionResponse, status_code=201)
 async def create_session(body: CreateSessionRequest):
-    try: user_uuid = uuid.UUID(body.user_id)
-    except ValueError: raise HTTPException(400, "Invalid user_id format")
+    try:
+        user_uuid = uuid.UUID(body.user_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid user_id format")
 
     async with AsyncSessionLocal() as db:
-           user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
+        user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
         if user is None:
             user = User(id=user_uuid, created_at=datetime.now(timezone.utc))
             db.add(user)
             await db.flush()
 
-        try: started_at_dt = datetime.fromisoformat(body.started_at.replace("Z", "+00:00"))
-        except ValueError: raise HTTPException(400, "Invalid started_at format")
+        try:
+            started_at_dt = datetime.fromisoformat(body.started_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(400, "Invalid started_at format")
 
         samples_list: list[dict[str, Any]] = [s.model_dump() for s in body.samples]
         times = [s["t"] for s in samples_list]
@@ -97,23 +101,28 @@ async def create_session(body: CreateSessionRequest):
         session = Session(id=session_id, user_id=user_uuid, started_at=started_at_dt,
                           duration_s=duration_s, sample_count=len(samples_list),
                           raw_samples=samples_list)
-        db.add(session); await db.flush()
+        db.add(session)
+        await db.flush()
 
         analysis_out = None
         if len(samples_list) >= 16:
             try:
                 results = analyze_samples(samples_list)
-                analysis = Analysis(id=uuid.uuid4(), session_id=session_id,
-                                    beta_x=results["x"]["beta"], beta_y=results["y"]["beta"],
-                                    beta_z=results["z"]["beta"], beta_magnitude=results["magnitude"]["beta"],
-                                    r2_x=results["x"]["r2"], r2_y=results["y"]["r2"],
-                                    r2_z=results["z"]["r2"], r2_magnitude=results["magnitude"]["r2"],
-                                    computed_at=datetime.now(timezone.utc))
-                db.add(analysis); analysis_out = _analysis_to_out(analysis)
+                analysis = Analysis(
+                    id=uuid.uuid4(), session_id=session_id,
+                    beta_x=results["x"]["beta"], beta_y=results["y"]["beta"],
+                    beta_z=results["z"]["beta"], beta_magnitude=results["magnitude"]["beta"],
+                    r2_x=results["x"]["r2"], r2_y=results["y"]["r2"],
+                    r2_z=results["z"]["r2"], r2_magnitude=results["magnitude"]["r2"],
+                    computed_at=datetime.now(timezone.utc)
+                )
+                db.add(analysis)
+                analysis_out = _analysis_to_out(analysis)
             except Exception as exc:
                 print(f"Analysis error for session {session_id}: {exc}")
 
         await db.commit()
+
     return CreateSessionResponse(session_id=str(session_id), analysis=analysis_out)
 
 @app.get("/users/{user_id}/sessions", response_model=list[SessionOut])
