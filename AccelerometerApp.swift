@@ -1,9 +1,7 @@
-
 import SwiftUI
 import CoreMotion
 import Charts
 
-// MARK: - Replace with your Railway deployment URL before running
 private let baseURL = "https://web-production-8cb5b.up.railway.app"
 
 // MARK: - Data Models
@@ -16,7 +14,7 @@ struct SessionSummary: Codable, Identifiable {
     let analysis: AnalysisResult?
 
     enum CodingKeys: String, CodingKey {
-        case id
+        case id = "session_id"
         case startedAt = "started_at"
         case durationS = "duration_s"
         case sampleCount = "sample_count"
@@ -25,24 +23,20 @@ struct SessionSummary: Codable, Identifiable {
 }
 
 struct AnalysisResult: Codable {
-    let betaX: Double
-    let betaY: Double
-    let betaZ: Double
-    let betaMagnitude: Double
-    let r2X: Double
-    let r2Y: Double
-    let r2Z: Double
-    let r2Magnitude: Double
+    let tau: Double?
+    let powerLawRange: Double?
+    let goodnessOfFit: Double?
+    let isScaleFree: Bool?
+    let nEvents: Int?
+    let error: String?
 
     enum CodingKeys: String, CodingKey {
-        case betaX = "beta_x"
-        case betaY = "beta_y"
-        case betaZ = "beta_z"
-        case betaMagnitude = "beta_magnitude"
-        case r2X = "r2_x"
-        case r2Y = "r2_y"
-        case r2Z = "r2_z"
-        case r2Magnitude = "r2_magnitude"
+        case tau
+        case powerLawRange = "power_law_range"
+        case goodnessOfFit = "goodness_of_fit"
+        case isScaleFree = "is_scale_free"
+        case nEvents = "n_events"
+        case error
     }
 }
 
@@ -133,7 +127,7 @@ class AccelerometerManager {
         currentMagnitude = mag; elapsedTime = elapsed
 
         buffer.append((t: elapsed, x: x, y: y, z: z, magnitude: mag))
-        writeSampleToCSV(t: elapsed, x: x, y: y, z: z, magnitude: mag)
+        writeSampleToCSV(t: elapsed, x: x, y: y, z: y, magnitude: mag)
     }
 
     private func setupCSVFile() {
@@ -296,17 +290,11 @@ struct SessionRowView: View {
 
     private var formattedDate: String {
         let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds, .withDashSeparatorInDate, .withColonSeparatorInTime]
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds,
+                           .withDashSeparatorInDate, .withColonSeparatorInTime]
         guard let date = f.date(from: session.startedAt) else { return session.startedAt }
         let d = DateFormatter(); d.dateStyle = .medium; d.timeStyle = .short
         return d.string(from: date)
-    }
-
-    private var betaColor: Color {
-        guard let a = session.analysis else { return .gray }
-        if a.betaMagnitude >= 0.8 && a.betaMagnitude <= 1.5 { return .green }
-        if a.betaMagnitude > 1.5 && a.betaMagnitude <= 2.5 { return .yellow }
-        return .red
     }
 
     var body: some View {
@@ -317,8 +305,14 @@ struct SessionRowView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 if let a = session.analysis {
-                    Label(String(format: "β=%.2f", a.betaMagnitude), systemImage: "chart.line.downtrend.xyaxis")
-                        .font(.caption.bold()).foregroundStyle(betaColor)
+                    if let tau = a.tau {
+                        Label(String(format: "τ=%.2f", tau), systemImage: "chart.line.downtrend.xyaxis")
+                            .font(.caption.bold())
+                            .foregroundStyle(a.isScaleFree == true ? .green : .orange)
+                    } else {
+                        Text(a.error != nil ? "No fit" : "Pending")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
                 } else {
                     Text("No analysis").font(.caption).foregroundStyle(.tertiary)
                 }
@@ -329,29 +323,13 @@ struct SessionRowView: View {
 
 // MARK: - SessionDetailView
 
-struct BetaBarEntry: Identifiable {
-    let id = UUID()
-    let axis: String
-    let beta: Double
-    let r2: Double
-}
-
 struct SessionDetailView: View {
     let session: SessionSummary
 
-    private var barEntries: [BetaBarEntry] {
-        guard let a = session.analysis else { return [] }
-        return [
-            BetaBarEntry(axis: "X",   beta: a.betaX,         r2: a.r2X),
-            BetaBarEntry(axis: "Y",   beta: a.betaY,         r2: a.r2Y),
-            BetaBarEntry(axis: "Z",   beta: a.betaZ,         r2: a.r2Z),
-            BetaBarEntry(axis: "Mag", beta: a.betaMagnitude, r2: a.r2Magnitude),
-        ]
-    }
-
     private var formattedDate: String {
         let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds, .withDashSeparatorInDate, .withColonSeparatorInTime]
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds,
+                           .withDashSeparatorInDate, .withColonSeparatorInTime]
         guard let date = f.date(from: session.startedAt) else { return session.startedAt }
         let d = DateFormatter(); d.dateStyle = .long; d.timeStyle = .medium
         return d.string(from: date)
@@ -360,64 +338,104 @@ struct SessionDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+
+                // Header
                 VStack(alignment: .leading, spacing: 6) {
                     Text(formattedDate).font(.subheadline).foregroundStyle(.secondary)
-                    Text(String(format: "Duration: %.1f s  •  %d samples", session.durationS, session.sampleCount))
+                    Text(String(format: "Duration: %.1f s  •  %d samples",
+                                session.durationS, session.sampleCount))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
 
-                if !barEntries.isEmpty {
-                    Text("Power Law Exponent (β)").font(.headline)
-
-                    Chart {
-                        ForEach(barEntries) { entry in
-                            BarMark(x: .value("Axis", entry.axis), y: .value("Beta", entry.beta))
-                                .foregroundStyle(barColor(for: entry.beta))
-                                .annotation(position: .top) {
-                                    Text(String(format: "%.2f", entry.beta))
-                                        .font(.caption2).foregroundStyle(.secondary)
-                                }
-                        }
-                        RuleMark(y: .value("Healthy baseline", 1.0))
-                            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
-                            .foregroundStyle(.gray.opacity(0.7))
-                            .annotation(position: .trailing, alignment: .leading) {
-                                Text("β=1 baseline").font(.caption2).foregroundStyle(.gray)
-                            }
+                if let a = session.analysis, a.tau != nil {
+                    // Scale-free badge
+                    HStack {
+                        Image(systemName: a.isScaleFree == true ? "checkmark.seal.fill" : "xmark.seal.fill")
+                            .foregroundStyle(a.isScaleFree == true ? .green : .red)
+                            .font(.title2)
+                        Text(a.isScaleFree == true ? "Scale-Free Dynamics" : "Not Scale-Free")
+                            .font(.title3.bold())
+                            .foregroundStyle(a.isScaleFree == true ? .green : .red)
+                        Spacer()
                     }
-                    .frame(height: 240)
-                    .chartYAxisLabel("β exponent")
-                    .chartXAxisLabel("Axis")
+                    .padding()
+                    .background((a.isScaleFree == true ? Color.green : Color.red).opacity(0.1),
+                                in: RoundedRectangle(cornerRadius: 12))
 
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Goodness of Fit (R²)").font(.subheadline.bold())
-                        ForEach(barEntries) { entry in
-                            HStack {
-                                Text(entry.axis).frame(width: 40, alignment: .leading).font(.caption.bold())
-                                ProgressView(value: min(max(entry.r2, 0), 1))
-                                    .tint(entry.r2 >= 0.7 ? .green : (entry.r2 >= 0.4 ? .yellow : .red))
-                                Text(String(format: "%.3f", entry.r2))
-                                    .font(.caption.monospacedDigit()).frame(width: 50, alignment: .trailing)
+                    // Tau
+                    VStack(spacing: 12) {
+                        VStack(spacing: 4) {
+                            Text("Power Law Exponent").font(.subheadline).foregroundStyle(.secondary)
+                            Text(String(format: "τ = %.3f", a.tau!))
+                                .font(.system(size: 48, weight: .bold, design: .rounded))
+                                .foregroundStyle(.primary)
+                            Text("Ideal range: 1.5 – 2.5").font(.caption).foregroundStyle(.secondary)
+                        }
+
+                        Divider()
+
+                        // Goodness of fit
+                        if let gof = a.goodnessOfFit {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Goodness of Fit").font(.subheadline.bold())
+                                    Spacer()
+                                    Text(String(format: "%.1f%%", gof * 100))
+                                        .font(.subheadline.bold())
+                                        .foregroundStyle(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
+                                }
+                                ProgressView(value: gof)
+                                    .tint(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
+                                Text("≥ 80% required for scale-free classification")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Divider()
+
+                        // Power law range + events
+                        HStack(spacing: 20) {
+                            if let plr = a.powerLawRange {
+                                statBox(label: "Fit Range", value: String(format: "%.2f dec", plr))
+                            }
+                            if let n = a.nEvents {
+                                statBox(label: "Events", value: "\(n)")
                             }
                         }
                     }
                     .padding()
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
 
-                    VStack(alignment: .leading, spacing: 4) {
+                    // Interpretation
+                    VStack(alignment: .leading, spacing: 6) {
                         Text("Interpretation").font(.subheadline.bold())
-                        Text("β ≈ 0    White noise (uncorrelated)")
-                        Text("β ≈ 1    1/f pink noise — typical healthy tremor")
-                        Text("β ≈ 2    Brownian / random-walk motion")
-                        Text("β > 2    Highly correlated, low-freq tremor dominant")
+                        Text("τ ≈ 1.5    Branching ratio near critical point")
+                        Text("τ ≈ 2.0    Mean-field critical exponent")
+                        Text("τ < 1.5    Sub-critical, reduced complexity")
+                        Text("τ > 2.5    Super-critical, excessive synchrony")
+                        Text("")
+                        Text("Scale-free movement dynamics (goodness of fit ≥ 80%) indicate healthy neurological function. Loss of scale-free behavior may reflect disease progression.")
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .font(.caption).foregroundStyle(.secondary).padding()
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding()
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
 
                 } else {
-                    ContentUnavailableView("No Analysis Available", systemImage: "chart.bar.xaxis",
-                        description: Text("Too few samples to compute power law fit."))
+                    // No analysis or error
+                    VStack(spacing: 8) {
+                        Image(systemName: "chart.bar.xaxis").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("No Analysis Available").font(.headline)
+                        if let a = session.analysis, let err = a.error {
+                            Text(err).font(.caption).foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        } else {
+                            Text("Too few samples or events detected.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity).padding(40)
                 }
             }.padding()
         }
@@ -425,10 +443,14 @@ struct SessionDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    private func barColor(for beta: Double) -> Color {
-        if beta >= 0.8 && beta <= 1.5 { return .green }
-        if beta > 1.5 && beta <= 2.5 { return .yellow }
-        return .red
+    private func statBox(label: String, value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(value).font(.title3.bold())
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(10)
+        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
