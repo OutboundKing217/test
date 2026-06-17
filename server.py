@@ -46,9 +46,9 @@ class SampleIn(BaseModel):
     z: float
     magnitude: float
 
-
 class SessionIn(BaseModel):
     user_id: str
+    user_name: str = ""
     started_at: str
     samples: list[SampleIn]
 
