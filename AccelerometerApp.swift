@@ -127,7 +127,7 @@ class AccelerometerManager {
         currentMagnitude = mag; elapsedTime = elapsed
 
         buffer.append((t: elapsed, x: x, y: y, z: z, magnitude: mag))
-        writeSampleToCSV(t: elapsed, x: x, y: y, z: y, magnitude: mag)
+       writeSampleToCSV(t: elapsed, x: x, y: y, z: z, magnitude: mag)
     }
 
     private func setupCSVFile() {
