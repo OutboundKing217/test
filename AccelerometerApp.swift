@@ -1,8 +1,12 @@
 import SwiftUI
 import CoreMotion
 import Charts
+import WatchConnectivity
 
 private let baseURL = "https://web-production-8cb5b.up.railway.app"
+private let sensorRecorderDuration: TimeInterval = 12 * 60 * 60
+private let recordedSessionStartKey = "recordedSessionStart"
+private let recordedSessionEndKey = "recordedSessionEnd"
 
 // MARK: - Data Models
 
@@ -51,7 +55,7 @@ struct SampleEntry: Codable {
 // MARK: - AccelerometerManager
 
 @Observable
-class AccelerometerManager {
+class AccelerometerManager: NSObject, WCSessionDelegate {
     let userID: String
 
     var isRecording = false
@@ -64,8 +68,10 @@ class AccelerometerManager {
     var sessions: [SessionSummary] = []
     var isUploading = false
     var uploadError: String?
+    var recorderStatus: String?
 
     private let motionManager = CMMotionManager()
+    private let sensorRecorder = CMSensorRecorder()
     private let updateInterval: TimeInterval = 1.0 / 30.0
 
     private var csvFileURL: URL?
@@ -74,13 +80,32 @@ class AccelerometerManager {
     private var startTime: TimeInterval?
     private var buffer: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
 
-    init() {
+    override init() {
         if let existing = UserDefaults.standard.string(forKey: "userID"), !existing.isEmpty {
             userID = existing
         } else {
             let newID = UUID().uuidString
             UserDefaults.standard.set(newID, forKey: "userID")
             userID = newID
+        }
+
+        super.init()
+        configureWatchConnectivity()
+        Task { await recoverRecordedSessionIfAvailable() }
+    }
+
+    private func configureWatchConnectivity() {
+        guard WCSession.isSupported() else { return }
+        let session = WCSession.default
+        session.delegate = self
+        session.activate()
+    }
+
+    private func sendUserIDToWatch(_ session: WCSession = .default) {
+        let context = ["userID": userID]
+        try? session.updateApplicationContext(context)
+        if session.isReachable {
+            session.sendMessage(context, replyHandler: nil)
         }
     }
 
@@ -95,6 +120,7 @@ class AccelerometerManager {
         elapsedTime = 0
 
         setupCSVFile()
+        startSensorRecording(at: recordingStartDate ?? Date())
 
         motionManager.accelerometerUpdateInterval = updateInterval
         motionManager.startAccelerometerUpdates(to: .main) { [weak self] data, error in
@@ -110,7 +136,24 @@ class AccelerometerManager {
         motionManager.stopAccelerometerUpdates()
         isRecording = false
         closeCSVFile()
-        Task { await self.uploadSession() }
+        finishSensorRecording(at: Date())
+        Task { await self.uploadRecordedSessionOrLiveBuffer() }
+    }
+
+    private func startSensorRecording(at startDate: Date) {
+        guard CMSensorRecorder.isAccelerometerRecordingAvailable() else {
+            recorderStatus = "Background accelerometer recording is not available on this device."
+            return
+        }
+        UserDefaults.standard.set(startDate, forKey: recordedSessionStartKey)
+        UserDefaults.standard.set(startDate.addingTimeInterval(sensorRecorderDuration), forKey: recordedSessionEndKey)
+        sensorRecorder.recordAccelerometer(forDuration: sensorRecorderDuration)
+        recorderStatus = "Background recording enabled."
+    }
+
+    private func finishSensorRecording(at endDate: Date) {
+        guard UserDefaults.standard.object(forKey: recordedSessionStartKey) != nil else { return }
+        UserDefaults.standard.set(endDate, forKey: recordedSessionEndKey)
     }
 
     private func handleSample(_ data: CMAccelerometerData) {
@@ -127,7 +170,7 @@ class AccelerometerManager {
         currentMagnitude = mag; elapsedTime = elapsed
 
         buffer.append((t: elapsed, x: x, y: y, z: z, magnitude: mag))
-       writeSampleToCSV(t: elapsed, x: x, y: y, z: z, magnitude: mag)
+        writeSampleToCSV(t: elapsed, x: x, y: y, z: z, magnitude: mag)
     }
 
     private func setupCSVFile() {
@@ -152,22 +195,81 @@ class AccelerometerManager {
         fileHandle = nil
     }
 
-    func uploadSession() async {
-        guard !buffer.isEmpty else { return }
+    private func uploadRecordedSessionOrLiveBuffer() async {
+        if await uploadRecordedSessionIfAvailable() {
+            buffer = []
+            return
+        }
+        _ = await uploadSession(samples: buffer, startedAt: recordingStartDate ?? Date())
+    }
+
+    private func uploadRecordedSessionIfAvailable() async -> Bool {
+        guard let startedAt = UserDefaults.standard.object(forKey: recordedSessionStartKey) as? Date,
+              let requestedEnd = UserDefaults.standard.object(forKey: recordedSessionEndKey) as? Date else {
+            return false
+        }
+        let endedAt = min(requestedEnd, Date())
+        guard endedAt > startedAt else { return false }
+        guard let samples = recordedSamples(from: startedAt, to: endedAt), !samples.isEmpty else {
+            return false
+        }
+        if await uploadSession(samples: samples, startedAt: startedAt) {
+            clearPendingRecordedSession()
+            await MainActor.run { recorderStatus = "Uploaded recorded accelerometer data." }
+            return true
+        }
+        return false
+    }
+
+    private func recoverRecordedSessionIfAvailable() async {
+        guard UserDefaults.standard.object(forKey: recordedSessionStartKey) != nil else { return }
+        if await uploadRecordedSessionIfAvailable() {
+            await fetchSessions()
+        } else {
+            await MainActor.run {
+                recorderStatus = "Recorded accelerometer data is not ready yet. Reopen the app in a few minutes."
+            }
+        }
+    }
+
+    private func recordedSamples(from startedAt: Date, to endedAt: Date) -> [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)]? {
+        guard let dataList = sensorRecorder.accelerometerData(from: startedAt, to: endedAt) else {
+            return nil
+        }
+        var samples: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
+        var iterator = NSFastEnumerationIterator(dataList)
+        while let data = iterator.next() as? CMRecordedAccelerometerData {
+            let x = data.acceleration.x
+            let y = data.acceleration.y
+            let z = data.acceleration.z
+            let magnitude = sqrt(x * x + y * y + z * z)
+            let elapsed = (data.startDate as NSDate).timeIntervalSince(startedAt)
+            samples.append((t: elapsed, x: x, y: y, z: z, magnitude: magnitude))
+        }
+        return samples
+    }
+
+    private func clearPendingRecordedSession() {
+        UserDefaults.standard.removeObject(forKey: recordedSessionStartKey)
+        UserDefaults.standard.removeObject(forKey: recordedSessionEndKey)
+    }
+
+    private func uploadSession(samples: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)], startedAt: Date) async -> Bool {
+        guard !samples.isEmpty else { return false }
         await MainActor.run { isUploading = true; uploadError = nil }
 
-        let samples = buffer.map { ["t": $0.t, "x": $0.x, "y": $0.y, "z": $0.z, "magnitude": $0.magnitude] }
+        let payloadSamples = samples.map { ["t": $0.t, "x": $0.x, "y": $0.y, "z": $0.z, "magnitude": $0.magnitude] }
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let body: [String: Any] = [
             "user_id": userID,
-            "started_at": isoFormatter.string(from: recordingStartDate ?? Date()),
-            "samples": samples
+            "started_at": isoFormatter.string(from: startedAt),
+            "samples": payloadSamples
         ]
 
         guard let url = URL(string: "\(baseURL)/sessions") else {
             await MainActor.run { isUploading = false; uploadError = "Invalid server URL" }
-            return
+            return false
         }
 
         do {
@@ -179,8 +281,10 @@ class AccelerometerManager {
             if let r = response as? HTTPURLResponse, r.statusCode >= 300 { throw URLError(.badServerResponse) }
             await MainActor.run { isUploading = false }
             await fetchSessions()
+            return true
         } catch {
             await MainActor.run { isUploading = false; uploadError = "Upload failed: \(error.localizedDescription)" }
+            return false
         }
     }
 
@@ -193,6 +297,27 @@ class AccelerometerManager {
         } catch {
             print("fetchSessions error: \(error)")
         }
+    }
+}
+
+extension AccelerometerManager {
+    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+        guard activationState == .activated else { return }
+        sendUserIDToWatch(session)
+    }
+
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        if message["request"] as? String == "userID" {
+            replyHandler(["userID": userID])
+        } else {
+            replyHandler([:])
+        }
+    }
+
+    func sessionDidBecomeInactive(_ session: WCSession) {}
+
+    func sessionDidDeactivate(_ session: WCSession) {
+        session.activate()
     }
 }
 
@@ -227,6 +352,11 @@ struct AccelerometerView: View {
                     HStack {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         Text(err).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                    }.padding(.horizontal)
+                } else if let status = manager.recorderStatus {
+                    HStack {
+                        Image(systemName: "recordingtape").foregroundStyle(.secondary)
+                        Text(status).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
                     }.padding(.horizontal)
                 }
 
@@ -339,7 +469,6 @@ struct SessionDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
 
-                // Header
                 VStack(alignment: .leading, spacing: 6) {
                     Text(formattedDate).font(.subheadline).foregroundStyle(.secondary)
                     Text(String(format: "Duration: %.1f s  •  %d samples",
@@ -363,7 +492,6 @@ struct SessionDetailView: View {
                     .background((a.isScaleFree == true ? Color.green : Color.red).opacity(0.1),
                                 in: RoundedRectangle(cornerRadius: 12))
 
-                    // Tau
                     VStack(spacing: 12) {
                         VStack(spacing: 4) {
                             Text("Power Law Exponent").font(.subheadline).foregroundStyle(.secondary)
@@ -375,7 +503,6 @@ struct SessionDetailView: View {
 
                         Divider()
 
-                        // Goodness of fit
                         if let gof = a.goodnessOfFit {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
@@ -394,7 +521,6 @@ struct SessionDetailView: View {
 
                         Divider()
 
-                        // Power law range + events
                         HStack(spacing: 20) {
                             if let plr = a.powerLawRange {
                                 statBox(label: "Fit Range", value: String(format: "%.2f dec", plr))
@@ -407,7 +533,6 @@ struct SessionDetailView: View {
                     .padding()
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
 
-                    // Interpretation
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Interpretation").font(.subheadline.bold())
                         Text("τ ≈ 1.5    Branching ratio near critical point")
@@ -423,7 +548,6 @@ struct SessionDetailView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
 
                 } else {
-                    // No analysis or error
                     VStack(spacing: 8) {
                         Image(systemName: "chart.bar.xaxis").font(.largeTitle).foregroundStyle(.secondary)
                         Text("No Analysis Available").font(.headline)
