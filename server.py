@@ -126,15 +126,20 @@ async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
     )
     sessions = result.scalars().all()
 
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    user_name = user.name if user else None
+
     out = []
     for s in sessions:
         a = s.analysis
         out.append({
             "session_id": s.id,
+            "user_name": user_name,
             "started_at": s.started_at.isoformat(),
             "duration_s": s.duration_s,
             "sample_count": s.sample_count,
             "analysis": {
+                "user_name": user_name,
                 "tau": a.tau,
                 "power_law_range": a.power_law_range,
                 "goodness_of_fit": a.goodness_of_fit,
@@ -144,6 +149,36 @@ async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
             } if a else None,
         })
     return out
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    s = (await db.execute(
+        select(DBSession).where(DBSession.id == session_id)
+    )).scalar_one_or_none()
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    user = (await db.execute(select(User).where(User.id == s.user_id))).scalar_one_or_none()
+    user_name = user.name if user else None
+
+    a = s.analysis
+    return {
+        "session_id": s.id,
+        "user_name": user_name,
+        "started_at": s.started_at.isoformat(),
+        "duration_s": s.duration_s,
+        "sample_count": s.sample_count,
+        "analysis": {
+            "user_name": user_name,
+            "tau": a.tau,
+            "power_law_range": a.power_law_range,
+            "goodness_of_fit": a.goodness_of_fit,
+            "is_scale_free": a.is_scale_free,
+            "n_events": a.n_events,
+            "error": a.error,
+        } if a else None,
+    }
 
 
 @app.get("/sessions/{session_id}")
