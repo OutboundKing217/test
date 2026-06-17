@@ -15,7 +15,7 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     created_at = Column(DateTime(timezone=True), nullable=False,
                         default=lambda: datetime.now(timezone.utc))
-    sessions = relationship("Session", back_populates="user", lazy="select")
+    sessions = relationship("Session", back_populates="user", lazy="selectin")
 
 
 class Session(Base):
@@ -27,8 +27,7 @@ class Session(Base):
     sample_count = Column(Integer, nullable=False, default=0)
     raw_samples = Column(JSONB, nullable=False, default=list)
     user = relationship("User", back_populates="sessions")
-    analysis = relationship("Analysis", back_populates="session", uselist=False, lazy="select")
-
+    analysis = relationship("Analysis", back_populates="session", uselist=False, lazy="selectin")
 
 class Analysis(Base):
     __tablename__ = "analyses"
