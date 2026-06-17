@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, UniqueConstraint
+
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -33,15 +34,13 @@ class Analysis(Base):
     __tablename__ = "analyses"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False, unique=True)
-    beta_x = Column(Float, nullable=False)
-    beta_y = Column(Float, nullable=False)
-    beta_z = Column(Float, nullable=False)
-    beta_magnitude = Column(Float, nullable=False)
-    r2_x = Column(Float, nullable=False)
-    r2_y = Column(Float, nullable=False)
-    r2_z = Column(Float, nullable=False)
-    r2_magnitude = Column(Float, nullable=False)
     computed_at = Column(DateTime(timezone=True), nullable=False,
                          default=lambda: datetime.now(timezone.utc))
+    tau = Column(Float, nullable=True)
+    power_law_range = Column(Float, nullable=True)
+    goodness_of_fit = Column(Float, nullable=True)
+    is_scale_free = Column(Boolean, nullable=True)
+    n_events = Column(Integer, nullable=True)
+    error = Column(String, nullable=True)
     session = relationship("Session", back_populates="analysis")
     __table_args__ = (UniqueConstraint("session_id", name="uq_analyses_session_id"),)
