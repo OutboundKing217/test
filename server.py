@@ -59,8 +59,11 @@ async def create_session(body: SessionIn, db: AsyncSession = Depends(get_db)):
 
     user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
     if user is None:
-        user = User(id=user_uuid, created_at=datetime.now(timezone.utc))
+        user = User(id=user_uuid, name=body.user_name, created_at=datetime.now(timezone.utc))
         db.add(user)
+        await db.flush()
+    elif body.user_name and user.name != body.user_name:
+        user.name = body.user_name
         await db.flush()
 
     started_at_str = body.started_at.replace("Z", "+00:00")
