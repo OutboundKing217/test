@@ -44,19 +44,12 @@ struct AnalysisResult: Codable {
     }
 }
 
-struct SampleEntry: Codable {
-    let t: Double
-    let x: Double
-    let y: Double
-    let z: Double
-    let magnitude: Double
-}
-
 // MARK: - AccelerometerManager
 
 @Observable
 class AccelerometerManager: NSObject, WCSessionDelegate {
     let userID: String
+    var userName: String
 
     var isRecording = false
     var elapsedTime: Double = 0
@@ -89,9 +82,16 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
             userID = newID
         }
 
+        userName = UserDefaults.standard.string(forKey: "userName") ?? ""
+
         super.init()
         configureWatchConnectivity()
         Task { await recoverRecordedSessionIfAvailable() }
+    }
+
+    func saveName(_ name: String) {
+        userName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(userName, forKey: "userName")
     }
 
     private func configureWatchConnectivity() {
@@ -243,7 +243,7 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
             let y = data.acceleration.y
             let z = data.acceleration.z
             let magnitude = sqrt(x * x + y * y + z * z)
-            let elapsed = (data.startDate as NSDate).timeIntervalSince(startedAt)
+            let elapsed = data.startDate.timeIntervalSince(startedAt)
             samples.append((t: elapsed, x: x, y: y, z: z, magnitude: magnitude))
         }
         return samples
@@ -263,6 +263,7 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let body: [String: Any] = [
             "user_id": userID,
+            "user_name": userName,
             "started_at": isoFormatter.string(from: startedAt),
             "samples": payloadSamples
         ]
@@ -321,6 +322,77 @@ extension AccelerometerManager {
     }
 }
 
+// MARK: - OnboardingView
+
+struct OnboardingView: View {
+    @Bindable var manager: AccelerometerManager
+    @State private var nameInput = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer()
+
+            VStack(spacing: 16) {
+                Image(systemName: "waveform.circle.fill")
+                    .font(.system(size: 72))
+                    .foregroundStyle(.blue)
+
+                Text("NeuroMotion")
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+
+                Text("Movement tracking for neurological health")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            Spacer()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Your Name")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+
+                TextField("Enter your full name", text: $nameInput)
+                    .font(.body)
+                    .padding()
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    .focused($focused)
+                    .submitLabel(.go)
+                    .onSubmit { confirmName() }
+            }
+            .padding(.horizontal)
+
+            Button(action: confirmName) {
+                Text("Get Started")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(
+                        nameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? Color.gray : Color.blue,
+                        in: RoundedRectangle(cornerRadius: 14)
+                    )
+            }
+            .disabled(nameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .padding(.horizontal)
+            .padding(.top, 12)
+
+            Spacer().frame(height: 48)
+        }
+        .onAppear { focused = true }
+    }
+
+    private func confirmName() {
+        let trimmed = nameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        manager.saveName(trimmed)
+    }
+}
+
 // MARK: - AccelerometerView
 
 struct AccelerometerView: View {
@@ -374,7 +446,7 @@ struct AccelerometerView: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("NeuroMotion")
+            .navigationTitle(manager.userName)
         }
     }
 
@@ -468,7 +540,6 @@ struct SessionDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-
                 VStack(alignment: .leading, spacing: 6) {
                     Text(formattedDate).font(.subheadline).foregroundStyle(.secondary)
                     Text(String(format: "Duration: %.1f s  •  %d samples",
@@ -478,7 +549,6 @@ struct SessionDetailView: View {
                 Divider()
 
                 if let a = session.analysis, a.tau != nil {
-                    // Scale-free badge
                     HStack {
                         Image(systemName: a.isScaleFree == true ? "checkmark.seal.fill" : "xmark.seal.fill")
                             .foregroundStyle(a.isScaleFree == true ? .green : .red)
@@ -584,13 +654,17 @@ struct ContentView: View {
     @State private var manager = AccelerometerManager()
 
     var body: some View {
-        TabView {
-            AccelerometerView(manager: manager)
-                .tabItem { Label("Record", systemImage: "waveform.circle") }
+        if manager.userName.isEmpty {
+            OnboardingView(manager: manager)
+        } else {
+            TabView {
+                AccelerometerView(manager: manager)
+                    .tabItem { Label("Record", systemImage: "waveform.circle") }
 
-            SessionHistoryView(manager: manager)
-                .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
-                .onAppear { Task { await manager.fetchSessions() } }
+                SessionHistoryView(manager: manager)
+                    .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
+                    .onAppear { Task { await manager.fetchSessions() } }
+            }
         }
     }
 }
