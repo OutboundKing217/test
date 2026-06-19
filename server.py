@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -39,12 +40,18 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/researcher")
+async def researcher_dashboard():
+    return FileResponse("researcher.html")
+
+
 class SampleIn(BaseModel):
     t: float
     x: float
     y: float
     z: float
     magnitude: float
+
 
 class SessionIn(BaseModel):
     user_id: str
@@ -117,6 +124,42 @@ async def create_session(body: SessionIn, db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.get("/dashboard/patients")
+async def get_all_patients(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).order_by(User.name))
+    users = result.scalars().all()
+    out = []
+    for u in users:
+        session_result = await db.execute(
+            select(DBSession).where(DBSession.user_id == u.id).order_by(DBSession.started_at.desc())
+        )
+        sessions = session_result.scalars().all()
+        session_list = []
+        for s in sessions:
+            a = s.analysis
+            session_list.append({
+                "session_id": str(s.id),
+                "started_at": s.started_at.isoformat(),
+                "duration_s": s.duration_s,
+                "sample_count": s.sample_count,
+                "analysis": {
+                    "tau": a.tau,
+                    "power_law_range": a.power_law_range,
+                    "goodness_of_fit": a.goodness_of_fit,
+                    "is_scale_free": a.is_scale_free,
+                    "n_events": a.n_events,
+                    "error": a.error,
+                } if a else None,
+            })
+        out.append({
+            "user_id": str(u.id),
+            "name": u.name or "Unknown",
+            "session_count": len(sessions),
+            "sessions": session_list,
+        })
+    return out
+
+
 @app.get("/users/{user_id}/sessions")
 async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
@@ -171,31 +214,6 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
         "sample_count": s.sample_count,
         "analysis": {
             "user_name": user_name,
-            "tau": a.tau,
-            "power_law_range": a.power_law_range,
-            "goodness_of_fit": a.goodness_of_fit,
-            "is_scale_free": a.is_scale_free,
-            "n_events": a.n_events,
-            "error": a.error,
-        } if a else None,
-    }
-
-
-@app.get("/sessions/{session_id}")
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    s = (await db.execute(
-        select(DBSession).where(DBSession.id == session_id)
-    )).scalar_one_or_none()
-    if s is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    a = s.analysis
-    return {
-        "session_id": s.id,
-        "started_at": s.started_at.isoformat(),
-        "duration_s": s.duration_s,
-        "sample_count": s.sample_count,
-        "analysis": {
             "tau": a.tau,
             "power_law_range": a.power_law_range,
             "goodness_of_fit": a.goodness_of_fit,
