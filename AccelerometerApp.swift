@@ -76,6 +76,12 @@ struct WatchSessionTransferPayload: Decodable {
     }
 }
 
+struct LivePoint: Identifiable {
+    let id = UUID()
+    let t: Double
+    let value: Double
+}
+
 // MARK: - AccelerometerManager
 
 @Observable
@@ -89,6 +95,9 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     var currentY: Double = 0
     var currentZ: Double = 0
     var currentMagnitude: Double = 0
+
+    var liveChartPoints: [LivePoint] = []
+    private let maxChartPoints = 150
 
     var sessions: [SessionSummary] = []
     var isUploading = false
@@ -104,6 +113,12 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     private var recordingStartDate: Date?
     private var startTime: TimeInterval?
     private var buffer: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
+
+    // Gravity smoothing for approximate dynamic magnitude display
+    private var gravX: Double = 0
+    private var gravY: Double = 0
+    private var gravZ: Double = 0
+    private let gravAlpha: Double = 0.95
 
     // Live WebSocket
     private var liveSocket: URLSessionWebSocketTask?
@@ -148,10 +163,12 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     func startUpdates() {
         guard motionManager.isAccelerometerAvailable, !isRecording else { return }
         buffer = []
+        liveChartPoints = []
         uploadError = nil
         recordingStartDate = Date()
         startTime = nil
         elapsedTime = 0
+        gravX = 0; gravY = 0; gravZ = 0
         setupCSVFile()
         startSensorRecording(at: recordingStartDate ?? Date())
         startLiveUpdates()
@@ -193,7 +210,7 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 
     private func startSensorRecording(at startDate: Date) {
         guard CMSensorRecorder.isAccelerometerRecordingAvailable() else {
-            recorderStatus = "Background accelerometer recording is not available on this device."
+            recorderStatus = "Background accelerometer recording not available on this device."
             return
         }
         UserDefaults.standard.set(startDate, forKey: recordedSessionStartKey)
@@ -210,7 +227,6 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     private func handleSample(_ data: CMAccelerometerData) {
         let now = data.timestamp
         if startTime == nil { startTime = now }
-        let elapsed = now - (startTime ?? now)
 
         let x = data.acceleration.x
         let y = data.acceleration.y
@@ -219,7 +235,26 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 
         currentX = x; currentY = y; currentZ = z
         currentMagnitude = mag
-        elapsedTime = recordingStartDate.map { Date().timeIntervalSince($0) } ?? elapsed
+        elapsedTime = recordingStartDate.map { Date().timeIntervalSince($0) } ?? (now - (startTime ?? now))
+
+        // Low-pass filter to estimate gravity, subtract for dynamic component
+        if gravX == 0 && gravY == 0 && gravZ == 0 {
+            gravX = x; gravY = y; gravZ = z
+        } else {
+            gravX = gravAlpha * gravX + (1 - gravAlpha) * x
+            gravY = gravAlpha * gravY + (1 - gravAlpha) * y
+            gravZ = gravAlpha * gravZ + (1 - gravAlpha) * z
+        }
+        let dynX = x - gravX
+        let dynY = y - gravY
+        let dynZ = z - gravZ
+        let dynMag = sqrt(dynX * dynX + dynY * dynY + dynZ * dynZ)
+
+        let point = LivePoint(t: elapsedTime, value: dynMag)
+        liveChartPoints.append(point)
+        if liveChartPoints.count > maxChartPoints {
+            liveChartPoints.removeFirst()
+        }
 
         buffer.append((t: elapsedTime, x: x, y: y, z: z, magnitude: mag))
         writeSampleToCSV(t: elapsedTime, x: x, y: y, z: z, magnitude: mag)
@@ -507,6 +542,58 @@ struct OnboardingView: View {
     }
 }
 
+// MARK: - LiveChartView
+
+struct LiveChartView: View {
+    let points: [LivePoint]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 7, height: 7)
+                    .opacity(0.9)
+                Text("Dynamic Magnitude")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+            }
+
+            if points.count < 2 {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(.systemGray6))
+                    .frame(height: 100)
+                    .overlay(
+                        Text("Move to see signal")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    )
+            } else {
+                Chart(points) { pt in
+                    LineMark(
+                        x: .value("Time", pt.t),
+                        y: .value("Mag", pt.value)
+                    )
+                    .foregroundStyle(Color.green)
+                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+                }
+                .chartXAxis(.hidden)
+                .chartYAxis {
+                    AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { val in
+                        AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [3]))
+                            .foregroundStyle(Color.secondary.opacity(0.3))
+                        AxisValueLabel()
+                            .font(.system(size: 9))
+                            .foregroundStyle(Color.secondary)
+                    }
+                }
+                .frame(height: 100)
+                .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+}
+
 // MARK: - AccelerometerView
 
 struct AccelerometerView: View {
@@ -514,53 +601,73 @@ struct AccelerometerView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
-                VStack(spacing: 8) {
-                    Text("Live Accelerometer").font(.headline)
-                    HStack(spacing: 20) {
-                        axisCard("X", value: manager.currentX, color: .red)
-                        axisCard("Y", value: manager.currentY, color: .green)
-                        axisCard("Z", value: manager.currentZ, color: .blue)
+            ScrollView {
+                VStack(spacing: 16) {
+
+                    // Live chart — shown during recording
+                    if manager.isRecording {
+                        LiveChartView(points: manager.liveChartPoints)
+                            .padding()
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                            .transition(.opacity.combined(with: .move(edge: .top)))
                     }
-                    HStack {
-                        Image(systemName: "waveform.path")
-                        Text(String(format: "Magnitude: %.4f g", manager.currentMagnitude)).monospacedDigit()
-                    }.foregroundStyle(.purple)
-                    Text(String(format: "Elapsed: %.1f s", manager.elapsedTime))
-                        .foregroundStyle(.secondary).monospacedDigit()
+
+                    // Raw axis readings
+                    VStack(spacing: 8) {
+                        Text("Raw Accelerometer").font(.headline)
+                        HStack(spacing: 20) {
+                            axisCard("X", value: manager.currentX, color: .red)
+                            axisCard("Y", value: manager.currentY, color: .green)
+                            axisCard("Z", value: manager.currentZ, color: .blue)
+                        }
+                        HStack {
+                            Image(systemName: "waveform.path")
+                            Text(String(format: "Magnitude: %.4f g", manager.currentMagnitude)).monospacedDigit()
+                        }.foregroundStyle(.purple)
+                        Text(String(format: "Elapsed: %.1f s", manager.elapsedTime))
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                    // Status messages
+                    if manager.isUploading {
+                        HStack { ProgressView(); Text("Uploading session...").foregroundStyle(.secondary) }
+                    } else if let err = manager.uploadError {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Text(err).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                        }.padding(.horizontal)
+                    } else if let status = manager.recorderStatus {
+                        HStack {
+                            Image(systemName: "recordingtape").foregroundStyle(.secondary)
+                            Text(status).font(.caption).foregroundStyle(.secondary)
+                        }.padding(.horizontal)
+                    }
+
+                    // Record button
+                    Button(action: {
+                        withAnimation { manager.isRecording ? manager.stopUpdates() : manager.startUpdates() }
+                    }) {
+                        Label(
+                            manager.isRecording ? "Stop Recording" : "Start Recording",
+                            systemImage: manager.isRecording ? "stop.circle.fill" : "record.circle"
+                        )
+                        .font(.title3.bold())
+                        .foregroundStyle(.white)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            manager.isRecording ? Color.red : Color.accentColor,
+                            in: RoundedRectangle(cornerRadius: 14)
+                        )
+                    }
+                    .padding(.horizontal)
                 }
                 .padding()
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-
-                if manager.isUploading {
-                    HStack { ProgressView(); Text("Uploading session...").foregroundStyle(.secondary) }
-                } else if let err = manager.uploadError {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        Text(err).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
-                    }.padding(.horizontal)
-                } else if let status = manager.recorderStatus {
-                    HStack {
-                        Image(systemName: "recordingtape").foregroundStyle(.secondary)
-                        Text(status).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
-                    }.padding(.horizontal)
-                }
-
-                Button(action: { manager.isRecording ? manager.stopUpdates() : manager.startUpdates() }) {
-                    Label(
-                        manager.isRecording ? "Stop Recording" : "Start Recording",
-                        systemImage: manager.isRecording ? "stop.circle.fill" : "record.circle"
-                    )
-                    .font(.title3.bold()).foregroundStyle(.white).padding()
-                    .frame(maxWidth: .infinity)
-                    .background(manager.isRecording ? Color.red : Color.accentColor,
-                                in: RoundedRectangle(cornerRadius: 14))
-                }.padding(.horizontal)
-
-                Spacer()
             }
-            .padding()
             .navigationTitle(manager.userName)
+            .animation(.easeInOut(duration: 0.3), value: manager.isRecording)
         }
     }
 
@@ -626,8 +733,7 @@ struct SessionRowView: View {
                             .font(.caption.bold())
                             .foregroundStyle(a.isScaleFree == true ? .green : .orange)
                     } else {
-                        Text(a.error != nil ? "No fit" : "Pending")
-                            .font(.caption).foregroundStyle(.tertiary)
+                        Text(a.error != nil ? "No fit" : "Pending").font(.caption).foregroundStyle(.tertiary)
                     }
                 } else {
                     Text("No analysis").font(.caption).foregroundStyle(.tertiary)
@@ -664,11 +770,9 @@ struct SessionDetailView: View {
                 if let a = session.analysis, a.tau != nil {
                     HStack {
                         Image(systemName: a.isScaleFree == true ? "checkmark.seal.fill" : "xmark.seal.fill")
-                            .foregroundStyle(a.isScaleFree == true ? .green : .red)
-                            .font(.title2)
+                            .foregroundStyle(a.isScaleFree == true ? .green : .red).font(.title2)
                         Text(a.isScaleFree == true ? "Scale-Free Dynamics" : "Not Scale-Free")
-                            .font(.title3.bold())
-                            .foregroundStyle(a.isScaleFree == true ? .green : .red)
+                            .font(.title3.bold()).foregroundStyle(a.isScaleFree == true ? .green : .red)
                         Spacer()
                     }
                     .padding()
@@ -692,8 +796,7 @@ struct SessionDetailView: View {
                                         .font(.subheadline.bold())
                                         .foregroundStyle(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
                                 }
-                                ProgressView(value: gof)
-                                    .tint(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
+                                ProgressView(value: gof).tint(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
                                 Text("≥ 80% required for scale-free classification")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
