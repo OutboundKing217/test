@@ -8,24 +8,21 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; display: flex; height: 100vh; overflow: hidden; }
 
-  /* Sidebar */
   #sidebar { width: 260px; background: #1a1d27; border-right: 1px solid #2d3148; display: flex; flex-direction: column; flex-shrink: 0; }
   #sidebar h2 { padding: 20px 16px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.2px; color: #6b7280; border-bottom: 1px solid #2d3148; }
   #patient-list { flex: 1; overflow-y: auto; padding: 8px 0; }
   .patient-item { padding: 12px 16px; cursor: pointer; border-left: 3px solid transparent; transition: all 0.15s; }
   .patient-item:hover { background: #22263a; }
   .patient-item.active { background: #1e2a4a; border-left-color: #3b82f6; }
-  .patient-name { font-weight: 600; font-size: 14px; }
+  .patient-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px; }
   .patient-meta { font-size: 12px; color: #6b7280; margin-top: 2px; }
 
-  /* Main */
   #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   #header { padding: 20px 28px; border-bottom: 1px solid #2d3148; background: #1a1d27; }
   #header h1 { font-size: 22px; font-weight: 700; }
   #header p { font-size: 13px; color: #6b7280; margin-top: 4px; }
 
-  /* Stats bar */
-  #stats-bar { display: flex; gap: 16px; padding: 16px 28px; background: #161923; border-bottom: 1px solid #2d3148; }
+  #stats-bar { display: flex; gap: 16px; padding: 16px 28px; background: #161923; border-bottom: 1px solid #2d3148; flex-shrink: 0; }
   .stat-card { flex: 1; background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 14px 16px; }
   .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; }
   .stat-value { font-size: 26px; font-weight: 700; margin-top: 4px; }
@@ -34,8 +31,14 @@
   .stat-value.purple { color: #a78bfa; }
   .stat-value.orange { color: #f59e0b; }
 
-  /* Table */
   #content { flex: 1; overflow-y: auto; padding: 24px 28px; }
+
+  #live-panel { display: none; background: #1a1d27; border: 1px solid #22c55e33; border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+  #live-panel h3 { font-size: 13px; font-weight: 700; color: #22c55e; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  #live-canvas { width: 100%; height: 100px; background: #0f1117; border-radius: 8px; display: block; }
+  .live-dot { width: 8px; height: 8px; background: #22c55e; border-radius: 50%; animation: pulse 1s infinite; flex-shrink: 0; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   thead th { text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; padding: 0 12px 10px; }
   tbody tr { border-top: 1px solid #1e2130; transition: background 0.1s; }
@@ -46,6 +49,7 @@
   .badge-green { background: rgba(34,197,94,0.15); color: #22c55e; }
   .badge-red { background: rgba(239,68,68,0.15); color: #ef4444; }
   .badge-gray { background: rgba(107,114,128,0.15); color: #9ca3af; }
+  .badge-live { background: rgba(34,197,94,0.2); color: #22c55e; font-size: 10px; padding: 2px 6px; }
 
   .gof-bar { width: 80px; height: 6px; background: #2d3148; border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 6px; }
   .gof-fill { height: 100%; border-radius: 3px; }
@@ -91,6 +95,9 @@
 
 <script>
 let allData = [];
+let liveSocket = null;
+let livePoints = [];
+const MAX_LIVE_POINTS = 300;
 
 async function load() {
   try {
@@ -110,7 +117,10 @@ function renderSidebar() {
   }
   list.innerHTML = allData.map((p, i) =>
     `<div class="patient-item" onclick="selectPatient(${i})" id="pat-${i}">
-      <div class="patient-name">${esc(p.name)}</div>
+      <div class="patient-name">
+        ${esc(p.name)}
+        ${p.is_live ? '<span class="badge badge-live">● LIVE</span>' : ''}
+      </div>
       <div class="patient-meta">${p.session_count} session${p.session_count !== 1 ? 's' : ''}</div>
     </div>`
   ).join('');
@@ -123,7 +133,6 @@ function selectPatient(idx) {
   const p = allData[idx];
   const sessions = p.sessions || [];
 
-  // Stats
   const scaleFreeCount = sessions.filter(s => s.analysis?.is_scale_free).length;
   const tauValues = sessions.map(s => s.analysis?.tau).filter(t => t != null);
   const avgTau = tauValues.length ? (tauValues.reduce((a,b) => a+b, 0) / tauValues.length) : null;
@@ -137,30 +146,38 @@ function selectPatient(idx) {
   document.getElementById('header').innerHTML =
     `<h1>${esc(p.name)}</h1><p>${sessions.length} recorded session${sessions.length !== 1 ? 's' : ''}</p>`;
 
-  // Table
   const content = document.getElementById('content');
+
   if (!sessions.length) {
-    content.innerHTML = '<div id="empty-state"><div class="icon">📭</div><p>No sessions recorded yet</p></div>';
-    return;
+    content.innerHTML = `
+      <div id="live-panel">
+        <h3><span class="live-dot"></span>Live Dynamic Magnitude</h3>
+        <canvas id="live-canvas"></canvas>
+      </div>
+      <div id="empty-state"><div class="icon">📭</div><p>No sessions recorded yet</p></div>`;
+  } else {
+    content.innerHTML = `
+      <div id="live-panel">
+        <h3><span class="live-dot"></span>Live Dynamic Magnitude</h3>
+        <canvas id="live-canvas"></canvas>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Date & Time</th>
+            <th>Duration</th>
+            <th>Samples</th>
+            <th>τ (tau)</th>
+            <th>Goodness of Fit</th>
+            <th>Scale-Free</th>
+            <th>Events</th>
+          </tr>
+        </thead>
+        <tbody>${sessions.map(s => renderRow(s)).join('')}</tbody>
+      </table>`;
   }
 
-  content.innerHTML = `
-    <table>
-      <thead>
-        <tr>
-          <th>Date & Time</th>
-          <th>Duration</th>
-          <th>Samples</th>
-          <th>τ (tau)</th>
-          <th>Goodness of Fit</th>
-          <th>Scale-Free</th>
-          <th>Events</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${sessions.map(s => renderRow(s)).join('')}
-      </tbody>
-    </table>`;
+  connectLive(p.user_id);
 }
 
 function renderRow(s) {
@@ -194,11 +211,79 @@ function renderRow(s) {
   </tr>`;
 }
 
+function connectLive(userId) {
+  if (liveSocket) { liveSocket.close(); liveSocket = null; }
+  livePoints = [];
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  liveSocket = new WebSocket(`${proto}://${location.host}/ws/watch/${userId}`);
+
+  liveSocket.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    for (const pt of (msg.points || [])) {
+      livePoints.push(pt.dynamic_mag);
+      if (livePoints.length > MAX_LIVE_POINTS) livePoints.shift();
+    }
+    drawLive();
+    document.getElementById('live-panel').style.display = 'block';
+  };
+
+  liveSocket.onclose = () => {
+    document.getElementById('live-panel').style.display = 'none';
+  };
+
+  setInterval(() => {
+    if (liveSocket?.readyState === 1) liveSocket.send('ping');
+  }, 25000);
+}
+
+function drawLive() {
+  const canvas = document.getElementById('live-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+  canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+  const pts = livePoints;
+  if (pts.length < 2) return;
+
+  const w = canvas.offsetWidth;
+  const h = canvas.offsetHeight;
+  const pad = 8;
+  const min = Math.min(...pts);
+  const max = Math.max(...pts);
+  const range = max - min || 0.001;
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Grid line at zero
+  const zeroY = h - pad - ((0 - min) / range) * (h - pad * 2);
+  ctx.beginPath();
+  ctx.strokeStyle = '#2d3148';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.moveTo(0, zeroY);
+  ctx.lineTo(w, zeroY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Signal line
+  ctx.beginPath();
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < pts.length; i++) {
+    const px = (i / (MAX_LIVE_POINTS - 1)) * w;
+    const py = h - pad - ((pts[i] - min) / range) * (h - pad * 2);
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+}
+
 function formatDate(iso) {
   if (!iso) return '—';
   try {
-    const d = new Date(iso);
-    return d.toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit' });
+    return new Date(iso).toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit' });
   } catch { return iso; }
 }
 
