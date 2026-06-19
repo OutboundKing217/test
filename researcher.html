@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NeuroMotion Researcher Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; display: flex; height: 100vh; overflow: hidden; }
+
+  /* Sidebar */
+  #sidebar { width: 260px; background: #1a1d27; border-right: 1px solid #2d3148; display: flex; flex-direction: column; flex-shrink: 0; }
+  #sidebar h2 { padding: 20px 16px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.2px; color: #6b7280; border-bottom: 1px solid #2d3148; }
+  #patient-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+  .patient-item { padding: 12px 16px; cursor: pointer; border-left: 3px solid transparent; transition: all 0.15s; }
+  .patient-item:hover { background: #22263a; }
+  .patient-item.active { background: #1e2a4a; border-left-color: #3b82f6; }
+  .patient-name { font-weight: 600; font-size: 14px; }
+  .patient-meta { font-size: 12px; color: #6b7280; margin-top: 2px; }
+
+  /* Main */
+  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #header { padding: 20px 28px; border-bottom: 1px solid #2d3148; background: #1a1d27; }
+  #header h1 { font-size: 22px; font-weight: 700; }
+  #header p { font-size: 13px; color: #6b7280; margin-top: 4px; }
+
+  /* Stats bar */
+  #stats-bar { display: flex; gap: 16px; padding: 16px 28px; background: #161923; border-bottom: 1px solid #2d3148; }
+  .stat-card { flex: 1; background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 14px 16px; }
+  .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; }
+  .stat-value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+  .stat-value.green { color: #22c55e; }
+  .stat-value.blue { color: #3b82f6; }
+  .stat-value.purple { color: #a78bfa; }
+  .stat-value.orange { color: #f59e0b; }
+
+  /* Table */
+  #content { flex: 1; overflow-y: auto; padding: 24px 28px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; padding: 0 12px 10px; }
+  tbody tr { border-top: 1px solid #1e2130; transition: background 0.1s; }
+  tbody tr:hover { background: #1a1d2a; }
+  td { padding: 13px 12px; vertical-align: middle; }
+
+  .badge { display: inline-block; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 700; }
+  .badge-green { background: rgba(34,197,94,0.15); color: #22c55e; }
+  .badge-red { background: rgba(239,68,68,0.15); color: #ef4444; }
+  .badge-gray { background: rgba(107,114,128,0.15); color: #9ca3af; }
+
+  .gof-bar { width: 80px; height: 6px; background: #2d3148; border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 6px; }
+  .gof-fill { height: 100%; border-radius: 3px; }
+
+  #empty-state { text-align: center; padding: 80px 20px; color: #4b5563; }
+  #empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+  #empty-state p { font-size: 15px; }
+
+  #loading { text-align: center; padding: 60px; color: #6b7280; }
+  .spinner { width: 32px; height: 32px; border: 3px solid #2d3148; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h2>Patients</h2>
+  <div id="patient-list"><div id="loading"><div class="spinner"></div>Loading...</div></div>
+</div>
+
+<div id="main">
+  <div id="header">
+    <h1>NeuroMotion</h1>
+    <p>Researcher Dashboard — select a patient to view sessions</p>
+  </div>
+  <div id="stats-bar">
+    <div class="stat-card"><div class="stat-label">Total Sessions</div><div class="stat-value blue" id="s-total">—</div></div>
+    <div class="stat-card"><div class="stat-label">Scale-Free</div><div class="stat-value green" id="s-scalefree">—</div></div>
+    <div class="stat-card"><div class="stat-label">Avg τ</div><div class="stat-value purple" id="s-tau">—</div></div>
+    <div class="stat-card"><div class="stat-label">Total Hours</div><div class="stat-value orange" id="s-hours">—</div></div>
+  </div>
+  <div id="content">
+    <div id="empty-state">
+      <div class="icon">👈</div>
+      <p>Select a patient from the sidebar</p>
+    </div>
+  </div>
+</div>
+
+<script>
+let allData = [];
+
+async function load() {
+  try {
+    const res = await fetch('/dashboard/patients');
+    allData = await res.json();
+    renderSidebar();
+  } catch(e) {
+    document.getElementById('patient-list').innerHTML = '<div style="padding:16px;color:#ef4444;font-size:13px;">Failed to load patients</div>';
+  }
+}
+
+function renderSidebar() {
+  const list = document.getElementById('patient-list');
+  if (!allData.length) {
+    list.innerHTML = '<div style="padding:16px;color:#6b7280;font-size:13px;">No patients yet</div>';
+    return;
+  }
+  list.innerHTML = allData.map((p, i) =>
+    `<div class="patient-item" onclick="selectPatient(${i})" id="pat-${i}">
+      <div class="patient-name">${esc(p.name)}</div>
+      <div class="patient-meta">${p.session_count} session${p.session_count !== 1 ? 's' : ''}</div>
+    </div>`
+  ).join('');
+}
+
+function selectPatient(idx) {
+  document.querySelectorAll('.patient-item').forEach(el => el.classList.remove('active'));
+  document.getElementById('pat-' + idx)?.classList.add('active');
+
+  const p = allData[idx];
+  const sessions = p.sessions || [];
+
+  // Stats
+  const scaleFreeCount = sessions.filter(s => s.analysis?.is_scale_free).length;
+  const tauValues = sessions.map(s => s.analysis?.tau).filter(t => t != null);
+  const avgTau = tauValues.length ? (tauValues.reduce((a,b) => a+b, 0) / tauValues.length) : null;
+  const totalHours = sessions.reduce((sum, s) => sum + (s.duration_s || 0), 0) / 3600;
+
+  document.getElementById('s-total').textContent = sessions.length;
+  document.getElementById('s-scalefree').textContent = scaleFreeCount;
+  document.getElementById('s-tau').textContent = avgTau != null ? avgTau.toFixed(3) : '—';
+  document.getElementById('s-hours').textContent = totalHours.toFixed(2);
+
+  document.getElementById('header').innerHTML =
+    `<h1>${esc(p.name)}</h1><p>${sessions.length} recorded session${sessions.length !== 1 ? 's' : ''}</p>`;
+
+  // Table
+  const content = document.getElementById('content');
+  if (!sessions.length) {
+    content.innerHTML = '<div id="empty-state"><div class="icon">📭</div><p>No sessions recorded yet</p></div>';
+    return;
+  }
+
+  content.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>Date & Time</th>
+          <th>Duration</th>
+          <th>Samples</th>
+          <th>τ (tau)</th>
+          <th>Goodness of Fit</th>
+          <th>Scale-Free</th>
+          <th>Events</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${sessions.map(s => renderRow(s)).join('')}
+      </tbody>
+    </table>`;
+}
+
+function renderRow(s) {
+  const a = s.analysis;
+  const date = formatDate(s.started_at);
+  const dur = s.duration_s != null ? formatDur(s.duration_s) : '—';
+  const tau = a?.tau != null ? a.tau.toFixed(3) : '—';
+  const gof = a?.goodness_of_fit != null ? a.goodness_of_fit : null;
+  const gofColor = gof == null ? '#6b7280' : gof >= 0.8 ? '#22c55e' : gof >= 0.6 ? '#f59e0b' : '#ef4444';
+  const gofBar = gof != null
+    ? `<div class="gof-bar"><div class="gof-fill" style="width:${Math.round(gof*100)}%;background:${gofColor}"></div></div>${Math.round(gof*100)}%`
+    : '—';
+
+  let badge;
+  if (!a || a.tau == null) {
+    badge = `<span class="badge badge-gray">${a?.error ? 'No Fit' : 'Pending'}</span>`;
+  } else if (a.is_scale_free) {
+    badge = `<span class="badge badge-green">✓ Scale-Free</span>`;
+  } else {
+    badge = `<span class="badge badge-red">✗ Not Scale-Free</span>`;
+  }
+
+  return `<tr>
+    <td>${date}</td>
+    <td>${dur}</td>
+    <td>${s.sample_count?.toLocaleString() ?? '—'}</td>
+    <td style="font-family:monospace;font-weight:600">${tau}</td>
+    <td>${gofBar}</td>
+    <td>${badge}</td>
+    <td>${a?.n_events ?? '—'}</td>
+  </tr>`;
+}
+
+function formatDate(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  } catch { return iso; }
+}
+
+function formatDur(s) {
+  if (s >= 3600) return (s/3600).toFixed(1) + ' hr';
+  if (s >= 60) return Math.round(s/60) + ' min';
+  return Math.round(s) + ' s';
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+load();
+</script>
+</body>
+</html>
