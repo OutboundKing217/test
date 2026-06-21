@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 from collections import defaultdict
@@ -35,13 +36,6 @@ LIVE_CUTOFF = 0.3
 LIVE_ORDER = 4
 
 
-def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(value)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
-
-
 def _make_causal_filter():
     nyq = 0.5 * LIVE_FS
     b, a = butter(LIVE_ORDER, LIVE_CUTOFF / nyq, btype="low")
@@ -70,7 +64,7 @@ def _process_live_samples(user_id: str, samples: list[dict]) -> list[dict]:
     grav_y, state["zi_y"] = lfilter(b, a, y_arr, zi=state["zi_y"])
     grav_z, state["zi_z"] = lfilter(b, a, z_arr, zi=state["zi_z"])
 
-    dyn_mag = np.sqrt((x_arr - grav_x) ** 2 + (y_arr - grav_y) ** 2 + (z_arr - grav_z) ** 2)
+    dyn_mag = np.sqrt((x_arr - grav_x)**2 + (y_arr - grav_y)**2 + (z_arr - grav_z)**2)
     return [{"t": t_arr[i], "dynamic_mag": round(float(dyn_mag[i]), 6)} for i in range(len(samples))]
 
 
@@ -83,6 +77,51 @@ async def startup():
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+
+async def _run_analysis_background(session_id: str, samples: list[dict]):
+    """Run heavy analysis after upload returns — never blocks the HTTP response."""
+    await asyncio.sleep(0)  # yield control so response is sent first
+    async with AsyncSessionLocal() as db:
+        try:
+            analysis_result: dict = {"error": "Too few samples (need 64+)", "dynamic_signal_csv": None}
+            if len(samples) >= 64:
+                try:
+                    loop = asyncio.get_event_loop()
+                    analysis_result = await loop.run_in_executor(None, analyze_samples, samples)
+                except Exception as exc:
+                    analysis_result = {"error": str(exc), "dynamic_signal_csv": None}
+
+            existing = (await db.execute(
+                select(Analysis).where(Analysis.session_id == session_id)
+            )).scalar_one_or_none()
+
+            if existing:
+                existing.computed_at = datetime.now(timezone.utc)
+                existing.tau = analysis_result.get("tau")
+                existing.power_law_range = analysis_result.get("power_law_range")
+                existing.goodness_of_fit = analysis_result.get("goodness_of_fit")
+                existing.is_scale_free = analysis_result.get("is_scale_free", False)
+                existing.n_events = analysis_result.get("n_events")
+                existing.error = analysis_result.get("error")
+                existing.dynamic_signal = analysis_result.get("dynamic_signal_csv")
+            else:
+                analysis = Analysis(
+                    session_id=session_id,
+                    computed_at=datetime.now(timezone.utc),
+                    tau=analysis_result.get("tau"),
+                    power_law_range=analysis_result.get("power_law_range"),
+                    goodness_of_fit=analysis_result.get("goodness_of_fit"),
+                    is_scale_free=analysis_result.get("is_scale_free", False),
+                    n_events=analysis_result.get("n_events"),
+                    error=analysis_result.get("error"),
+                    dynamic_signal=analysis_result.get("dynamic_signal_csv"),
+                )
+                db.add(analysis)
+
+            await db.commit()
+        except Exception as exc:
+            print(f"Background analysis failed for session {session_id}: {exc}")
 
 
 @app.get("/health")
@@ -100,14 +139,12 @@ async def get_all_patients(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).order_by(User.name))
     users = result.scalars().all()
     out = []
-
     for u in users:
         session_result = await db.execute(
             select(DBSession).where(DBSession.user_id == u.id).order_by(DBSession.started_at.desc())
         )
         sessions = session_result.scalars().all()
         session_list = []
-
         for s in sessions:
             a = s.analysis
             session_list.append({
@@ -124,7 +161,6 @@ async def get_all_patients(db: AsyncSession = Depends(get_db)):
                     "error": a.error,
                 } if a else None,
             })
-
         out.append({
             "user_id": str(u.id),
             "name": u.name or "Unknown",
@@ -132,29 +168,23 @@ async def get_all_patients(db: AsyncSession = Depends(get_db)):
             "sessions": session_list,
             "is_live": str(u.id) in _filter_states,
         })
-
     return out
 
 
 @app.get("/sessions/{session_id}/signal.csv")
 async def download_signal_csv(session_id: str, db: AsyncSession = Depends(get_db)):
-    session_uuid = _parse_uuid(session_id, "session_id")
-
     s = (await db.execute(
-        select(DBSession).where(DBSession.id == session_uuid)
+        select(DBSession).where(DBSession.id == session_id)
     )).scalar_one_or_none()
-
     if s is None:
         raise HTTPException(status_code=404, detail="Session not found")
-
     a = s.analysis
     if a is None or not a.dynamic_signal:
-        raise HTTPException(status_code=404, detail="No signal data for this session")
-
+        raise HTTPException(status_code=404, detail="No signal data yet — analysis may still be running")
     return StreamingResponse(
         iter([a.dynamic_signal]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=session_{str(s.id)[:8]}_signal.csv"},
+        headers={"Content-Disposition": f"attachment; filename=session_{session_id[:8]}_signal.csv"},
     )
 
 
@@ -175,7 +205,7 @@ class SessionIn(BaseModel):
 
 @app.post("/sessions")
 async def create_session(body: SessionIn, db: AsyncSession = Depends(get_db)):
-    user_uuid = _parse_uuid(body.user_id, "user_id")
+    user_uuid = body.user_id
 
     user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
     if user is None:
@@ -191,12 +221,11 @@ async def create_session(body: SessionIn, db: AsyncSession = Depends(get_db)):
         started_at_dt = datetime.fromisoformat(started_at_str)
     except ValueError:
         started_at_dt = datetime.now(timezone.utc)
-
     if started_at_dt.tzinfo is None:
         started_at_dt = started_at_dt.replace(tzinfo=timezone.utc)
 
     samples = [s.model_dump() for s in body.samples]
-    session_id = uuid.uuid4()
+    session_id = str(uuid.uuid4())
     duration_s = samples[-1]["t"] - samples[0]["t"] if len(samples) >= 2 else 0.0
 
     db_session = DBSession(
@@ -208,55 +237,36 @@ async def create_session(body: SessionIn, db: AsyncSession = Depends(get_db)):
         raw_samples=samples,
     )
     db.add(db_session)
-    await db.flush()
 
-    analysis_result: dict = {"error": "Too few samples (need 64+)", "dynamic_signal_csv": None}
-    if len(samples) >= 64:
-        try:
-            analysis_result = analyze_samples(samples)
-        except Exception as exc:
-            analysis_result = {"error": str(exc), "dynamic_signal_csv": None}
-
-    analysis = Analysis(
+    # Save a placeholder analysis row immediately
+    placeholder = Analysis(
         session_id=session_id,
         computed_at=datetime.now(timezone.utc),
-        tau=analysis_result.get("tau"),
-        power_law_range=analysis_result.get("power_law_range"),
-        goodness_of_fit=analysis_result.get("goodness_of_fit"),
-        is_scale_free=analysis_result.get("is_scale_free", False),
-        n_events=analysis_result.get("n_events"),
-        error=analysis_result.get("error"),
-        dynamic_signal=analysis_result.get("dynamic_signal_csv"),
+        error="Analysis pending...",
     )
-    db.add(analysis)
+    db.add(placeholder)
     await db.commit()
 
-    _filter_states.pop(str(user_uuid), None)
+    # Fire analysis in background — does NOT block the HTTP response
+    asyncio.create_task(_run_analysis_background(session_id, samples))
+    _filter_states.pop(user_uuid, None)
 
-    return {
-        "session_id": str(session_id),
-        "sample_count": len(samples),
-        "analysis": {k: v for k, v in analysis_result.items() if k != "dynamic_signal_csv"},
-    }
+    return {"session_id": session_id, "sample_count": len(samples), "status": "uploaded"}
 
 
 @app.get("/users/{user_id}/sessions")
 async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
-    user_uuid = _parse_uuid(user_id, "user_id")
-
     result = await db.execute(
-        select(DBSession).where(DBSession.user_id == user_uuid).order_by(DBSession.started_at.desc())
+        select(DBSession).where(DBSession.user_id == user_id).order_by(DBSession.started_at.desc())
     )
     sessions = result.scalars().all()
-
-    user = (await db.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     user_name = user.name if user else None
-
     out = []
     for s in sessions:
         a = s.analysis
         out.append({
-            "session_id": str(s.id),
+            "session_id": s.id,
             "user_name": user_name,
             "started_at": s.started_at.isoformat(),
             "duration_s": s.duration_s,
@@ -271,27 +281,21 @@ async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
                 "error": a.error,
             } if a else None,
         })
-
     return out
 
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    session_uuid = _parse_uuid(session_id, "session_id")
-
     s = (await db.execute(
-        select(DBSession).where(DBSession.id == session_uuid)
+        select(DBSession).where(DBSession.id == session_id)
     )).scalar_one_or_none()
-
     if s is None:
         raise HTTPException(status_code=404, detail="Session not found")
-
     user = (await db.execute(select(User).where(User.id == s.user_id))).scalar_one_or_none()
     user_name = user.name if user else None
     a = s.analysis
-
     return {
-        "session_id": str(s.id),
+        "session_id": s.id,
         "user_name": user_name,
         "started_at": s.started_at.isoformat(),
         "duration_s": s.duration_s,
@@ -317,19 +321,15 @@ async def ws_ingest(websocket: WebSocket, user_id: str):
             samples = data.get("samples", [])
             if not samples:
                 continue
-
             processed = _process_live_samples(user_id, samples)
             dead = []
-
             for ws in _watchers.get(user_id, []):
                 try:
                     await ws.send_json({"user_id": user_id, "points": processed})
                 except Exception:
                     dead.append(ws)
-
             for ws in dead:
                 _watchers[user_id].remove(ws)
-
     except WebSocketDisconnect:
         _filter_states.pop(user_id, None)
 
@@ -338,7 +338,6 @@ async def ws_ingest(websocket: WebSocket, user_id: str):
 async def ws_watch(websocket: WebSocket, user_id: str):
     await websocket.accept()
     _watchers[user_id].append(websocket)
-
     try:
         while True:
             await websocket.receive_text()
