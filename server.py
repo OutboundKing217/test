@@ -54,16 +54,13 @@ def _process_live_samples(user_id: str, samples: list[dict]) -> list[dict]:
 
     state = _filter_states[user_id]
     b, a = state["b"], state["a"]
-
     x_arr = np.array([s["x"] for s in samples], dtype=float)
     y_arr = np.array([s["y"] for s in samples], dtype=float)
     z_arr = np.array([s["z"] for s in samples], dtype=float)
     t_arr = [s["t"] for s in samples]
-
     grav_x, state["zi_x"] = lfilter(b, a, x_arr, zi=state["zi_x"])
     grav_y, state["zi_y"] = lfilter(b, a, y_arr, zi=state["zi_y"])
     grav_z, state["zi_z"] = lfilter(b, a, z_arr, zi=state["zi_z"])
-
     dyn_mag = np.sqrt((x_arr - grav_x)**2 + (y_arr - grav_y)**2 + (z_arr - grav_z)**2)
     return [{"t": t_arr[i], "dynamic_mag": round(float(dyn_mag[i]), 6)} for i in range(len(samples))]
 
@@ -80,8 +77,7 @@ async def get_db():
 
 
 async def _run_analysis_background(session_id: str, samples: list[dict]):
-    """Run heavy analysis after upload returns — never blocks the HTTP response."""
-    await asyncio.sleep(0)  # yield control so response is sent first
+    await asyncio.sleep(0)
     async with AsyncSessionLocal() as db:
         try:
             analysis_result: dict = {"error": "Too few samples (need 64+)", "dynamic_signal_csv": None}
@@ -106,7 +102,7 @@ async def _run_analysis_background(session_id: str, samples: list[dict]):
                 existing.error = analysis_result.get("error")
                 existing.dynamic_signal = analysis_result.get("dynamic_signal_csv")
             else:
-                analysis = Analysis(
+                db.add(Analysis(
                     session_id=session_id,
                     computed_at=datetime.now(timezone.utc),
                     tau=analysis_result.get("tau"),
@@ -116,8 +112,14 @@ async def _run_analysis_background(session_id: str, samples: list[dict]):
                     n_events=analysis_result.get("n_events"),
                     error=analysis_result.get("error"),
                     dynamic_signal=analysis_result.get("dynamic_signal_csv"),
-                )
-                db.add(analysis)
+                ))
+
+            # Clear raw samples after analysis to prevent DB bloat
+            session_row = (await db.execute(
+                select(DBSession).where(DBSession.id == session_id)
+            )).scalar_one_or_none()
+            if session_row:
+                session_row.raw_samples = []
 
             await db.commit()
         except Exception as exc:
@@ -237,17 +239,13 @@ async def create_session(body: SessionIn, db: AsyncSession = Depends(get_db)):
         raw_samples=samples,
     )
     db.add(db_session)
-
-    # Save a placeholder analysis row immediately
-    placeholder = Analysis(
+    db.add(Analysis(
         session_id=session_id,
         computed_at=datetime.now(timezone.utc),
         error="Analysis pending...",
-    )
-    db.add(placeholder)
+    ))
     await db.commit()
 
-    # Fire analysis in background — does NOT block the HTTP response
     asyncio.create_task(_run_analysis_background(session_id, samples))
     _filter_states.pop(user_uuid, None)
 
