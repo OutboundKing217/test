@@ -112,18 +112,25 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     private var fileHandle: FileHandle?
     private var recordingStartDate: Date?
     private var startTime: TimeInterval?
-    private var buffer: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
 
-    // Gravity smoothing for approximate dynamic magnitude display
+    // Live buffer only kept for fallback when CMSensorRecorder unavailable
+    private var buffer: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
+    private let maxBufferSize = 200_000 // ~1.85 hours at 30Hz safety cap
+
     private var gravX: Double = 0
     private var gravY: Double = 0
     private var gravZ: Double = 0
     private let gravAlpha: Double = 0.95
 
-    // Live WebSocket
     private var liveSocket: URLSessionWebSocketTask?
     private var liveSampleBuffer: [SampleEntry] = []
     private var liveFlushTimer: Timer?
+
+    private let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 
     override init() {
         if let existing = UserDefaults.standard.string(forKey: "userID"), !existing.isEmpty {
@@ -147,18 +154,17 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 
     private func configureWatchConnectivity() {
         guard WCSession.isSupported() else { return }
-        let session = WCSession.default
-        session.delegate = self
-        session.activate()
+        WCSession.default.delegate = self
+        WCSession.default.activate()
     }
 
     private func sendUserIDToWatch(_ session: WCSession = .default) {
         let context = ["userID": userID]
         try? session.updateApplicationContext(context)
-        if session.isReachable {
-            session.sendMessage(context, replyHandler: nil)
-        }
+        if session.isReachable { session.sendMessage(context, replyHandler: nil) }
     }
+
+    // MARK: - Recording
 
     func startUpdates() {
         guard motionManager.isAccelerometerAvailable, !isRecording else { return }
@@ -183,7 +189,7 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         closeCSVFile()
         stopLiveStream()
         finishSensorRecording(at: Date())
-        Task { await self.uploadRecordedSessionOrLiveBuffer() }
+        Task { await self.uploadAfterStop() }
     }
 
     private func restorePendingRecording() {
@@ -210,7 +216,7 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 
     private func startSensorRecording(at startDate: Date) {
         guard CMSensorRecorder.isAccelerometerRecordingAvailable() else {
-            recorderStatus = "Background accelerometer recording not available on this device."
+            recorderStatus = "Background recording not available on this device."
             return
         }
         UserDefaults.standard.set(startDate, forKey: recordedSessionStartKey)
@@ -231,13 +237,12 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         let x = data.acceleration.x
         let y = data.acceleration.y
         let z = data.acceleration.z
-        let mag = sqrt(x * x + y * y + z * z)
+        let mag = sqrt(x*x + y*y + z*z)
 
         currentX = x; currentY = y; currentZ = z
         currentMagnitude = mag
         elapsedTime = recordingStartDate.map { Date().timeIntervalSince($0) } ?? (now - (startTime ?? now))
 
-        // Low-pass filter to estimate gravity, subtract for dynamic component
         if gravX == 0 && gravY == 0 && gravZ == 0 {
             gravX = x; gravY = y; gravZ = z
         } else {
@@ -245,18 +250,16 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
             gravY = gravAlpha * gravY + (1 - gravAlpha) * y
             gravZ = gravAlpha * gravZ + (1 - gravAlpha) * z
         }
-        let dynX = x - gravX
-        let dynY = y - gravY
-        let dynZ = z - gravZ
-        let dynMag = sqrt(dynX * dynX + dynY * dynY + dynZ * dynZ)
+        let dynMag = sqrt(pow(x - gravX, 2) + pow(y - gravY, 2) + pow(z - gravZ, 2))
 
-        let point = LivePoint(t: elapsedTime, value: dynMag)
-        liveChartPoints.append(point)
-        if liveChartPoints.count > maxChartPoints {
-            liveChartPoints.removeFirst()
+        liveChartPoints.append(LivePoint(t: elapsedTime, value: dynMag))
+        if liveChartPoints.count > maxChartPoints { liveChartPoints.removeFirst() }
+
+        // Only keep buffer if sensor recorder unavailable, cap to avoid memory issues
+        if buffer.count < maxBufferSize {
+            buffer.append((t: elapsedTime, x: x, y: y, z: z, magnitude: mag))
         }
 
-        buffer.append((t: elapsedTime, x: x, y: y, z: z, magnitude: mag))
         writeSampleToCSV(t: elapsedTime, x: x, y: y, z: z, magnitude: mag)
         sendLiveSample(SampleEntry(t: elapsedTime, x: x, y: y, z: z, magnitude: mag))
     }
@@ -318,34 +321,106 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 
     // MARK: - Upload
 
-    private func uploadRecordedSessionOrLiveBuffer() async {
-        if await uploadRecordedSessionIfAvailable() {
-            buffer = []
-            return
+    private func uploadAfterStop() async {
+        // Always prefer CMSensorRecorder — it has the full recording even if app was backgrounded
+        let didUploadFromRecorder = await uploadFromSensorRecorderInWindows()
+        if !didUploadFromRecorder {
+            // Fallback: use in-memory buffer (only works if app stayed open)
+            await uploadInChunks(samples: buffer, startedAt: recordingStartDate ?? Date())
         }
-        await uploadInChunks(samples: buffer, startedAt: recordingStartDate ?? Date())
+        buffer = []
     }
 
-    private func uploadRecordedSessionIfAvailable() async -> Bool {
+    private func recoverFinishedRecordingIfAvailable() async {
+        guard let endDate = UserDefaults.standard.object(forKey: recordedSessionEndKey) as? Date,
+              endDate <= Date() else { return }
+        await MainActor.run {
+            isRecording = false
+            motionManager.stopAccelerometerUpdates()
+            closeCSVFile()
+        }
+        let success = await uploadFromSensorRecorderInWindows()
+        if !success {
+            await MainActor.run { recorderStatus = "Recorded data not ready yet. Reopen app in a few minutes." }
+        }
+    }
+
+    /// Streams data from CMSensorRecorder in 30-minute windows.
+    /// Never loads more than 30 minutes into memory — safe for 12-hour recordings.
+    private func uploadFromSensorRecorderInWindows() async -> Bool {
         guard let startedAt = UserDefaults.standard.object(forKey: recordedSessionStartKey) as? Date,
-              let requestedEnd = UserDefaults.standard.object(forKey: recordedSessionEndKey) as? Date else { return false }
+              let requestedEnd = UserDefaults.standard.object(forKey: recordedSessionEndKey) as? Date else {
+            return false
+        }
         let endedAt = min(requestedEnd, Date())
         guard endedAt > startedAt else { return false }
-        guard let samples = recordedSamples(from: startedAt, to: endedAt), !samples.isEmpty else { return false }
-        await uploadInChunks(samples: samples, startedAt: startedAt)
+
+        let windowDuration: TimeInterval = 1800 // 30 minutes per chunk
+        let totalDuration = endedAt.timeIntervalSince(startedAt)
+        let totalChunks = max(1, Int(ceil(totalDuration / windowDuration)))
+
+        var windowStart = startedAt
+        var successCount = 0
+        var chunkIndex = 0
+
+        await MainActor.run {
+            recorderStatus = "Preparing \(totalChunks) chunk\(totalChunks == 1 ? "" : "s") for upload..."
+        }
+
+        while windowStart < endedAt {
+            let windowEnd = min(windowStart.addingTimeInterval(windowDuration), endedAt)
+            chunkIndex += 1
+
+            await MainActor.run {
+                recorderStatus = "Uploading chunk \(chunkIndex) of \(totalChunks)..."
+            }
+
+            // Read only this 30-min window — previous window is released from memory
+            if let samples = recordedSamples(from: windowStart, to: windowEnd), !samples.isEmpty {
+                let payloadSamples = samples.map {
+                    SampleEntry(t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude)
+                }
+                let success = await uploadSession(
+                    startedAt: isoFormatter.string(from: windowStart),
+                    samples: payloadSamples
+                )
+                if success { successCount += 1 }
+            }
+
+            windowStart = windowEnd
+
+            // Brief pause between chunks so server isn't overwhelmed
+            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3s
+        }
+
         clearPendingRecordedSession()
-        return true
+        await fetchSessions()
+
+        await MainActor.run {
+            if successCount == 0 {
+                recorderStatus = "Upload failed — no data retrieved from sensor recorder."
+            } else if successCount < totalChunks {
+                recorderStatus = "Uploaded \(successCount) of \(totalChunks) chunks. Some failed."
+            } else {
+                recorderStatus = totalChunks > 1 ? "Uploaded \(totalChunks) chunks successfully." : nil
+            }
+        }
+
+        return successCount > 0
     }
 
+    /// Fallback chunked upload from in-memory buffer (used when CMSensorRecorder unavailable)
     private func uploadInChunks(
         samples: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)],
         startedAt: Date
     ) async {
-        let chunkDuration: Double = 3600
+        guard !samples.isEmpty else { return }
+
+        let chunkDuration: Double = 1800
         var chunks: [( [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)], Date )] = []
         var chunkSamples: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
         var chunkOriginT: Double = samples.first?.t ?? 0
-        var chunkStartDate: Date = startedAt
+        var chunkStartDate = startedAt
 
         for sample in samples {
             if sample.t - chunkOriginT >= chunkDuration && !chunkSamples.isEmpty {
@@ -359,30 +434,26 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         if !chunkSamples.isEmpty { chunks.append((chunkSamples, chunkStartDate)) }
 
         let total = chunks.count
+        var successCount = 0
+
         for (i, (chunk, chunkStart)) in chunks.enumerated() {
-            await MainActor.run {
-                recorderStatus = total > 1 ? "Uploading hour \(i + 1) of \(total)..." : "Uploading session..."
+            await MainActor.run { recorderStatus = "Uploading chunk \(i + 1) of \(total)..." }
+            let payloadSamples = chunk.map {
+                SampleEntry(t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude)
             }
-            let payloadSamples = chunk.map { SampleEntry(t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude) }
-            let isoFormatter = ISO8601DateFormatter()
-            isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            _ = await uploadSession(startedAt: isoFormatter.string(from: chunkStart), samples: payloadSamples)
+            let success = await uploadSession(
+                startedAt: isoFormatter.string(from: chunkStart),
+                samples: payloadSamples
+            )
+            if success { successCount += 1 }
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
         await fetchSessions()
-        await MainActor.run { recorderStatus = total > 1 ? "Uploaded \(total) hours of data." : nil }
-    }
-
-    private func recoverFinishedRecordingIfAvailable() async {
-        guard let endDate = UserDefaults.standard.object(forKey: recordedSessionEndKey) as? Date,
-              endDate <= Date() else { return }
         await MainActor.run {
-            isRecording = false
-            motionManager.stopAccelerometerUpdates()
-            closeCSVFile()
-        }
-        if !(await uploadRecordedSessionIfAvailable()) {
-            await MainActor.run { recorderStatus = "Recorded data not ready yet. Reopen the app in a few minutes." }
+            recorderStatus = successCount == total
+                ? (total > 1 ? "Uploaded \(total) chunks." : nil)
+                : "Uploaded \(successCount) of \(total) chunks."
         }
     }
 
@@ -394,11 +465,10 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
             let x = data.acceleration.x
             let y = data.acceleration.y
             let z = data.acceleration.z
-            let magnitude = sqrt(x * x + y * y + z * z)
             let elapsed = data.startDate.timeIntervalSince(startedAt)
-            samples.append((t: elapsed, x: x, y: y, z: z, magnitude: magnitude))
+            samples.append((t: elapsed, x: x, y: y, z: z, magnitude: sqrt(x*x + y*y + z*z)))
         }
-        return samples
+        return samples.isEmpty ? nil : samples
     }
 
     private func clearPendingRecordedSession() {
@@ -418,9 +488,14 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 120
             request.httpBody = try JSONEncoder().encode(body)
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let r = response as? HTTPURLResponse, r.statusCode >= 300 { throw URLError(.badServerResponse) }
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let r = response as? HTTPURLResponse, r.statusCode >= 300 {
+                let msg = String(data: data, encoding: .utf8) ?? "HTTP \(r.statusCode)"
+                await MainActor.run { isUploading = false; uploadError = "Upload failed: \(msg)" }
+                return false
+            }
             await MainActor.run { isUploading = false }
             return true
         } catch {
@@ -429,12 +504,15 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         }
     }
 
-    private func receiveWatchSessionFile(_ fileURL: URL) async {
+    private func receiveWatchSessionData(_ data: Data) async {
         await MainActor.run { isUploading = true; uploadError = nil }
         do {
-            let data = try Data(contentsOf: fileURL)
             let payload = try JSONDecoder().decode(WatchSessionTransferPayload.self, from: data)
-            _ = await uploadSession(startedAt: payload.startedAt, samples: payload.samples)
+            let samples = payload.samples.map {
+                (t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude)
+            }
+            let startDate = isoFormatter.date(from: payload.startedAt) ?? Date()
+            await uploadInChunks(samples: samples, startedAt: startDate)
         } catch {
             await MainActor.run {
                 isUploading = false
@@ -473,7 +551,12 @@ extension AccelerometerManager {
 
     func session(_ session: WCSession, didReceive file: WCSessionFile) {
         guard file.metadata?["kind"] as? String == "watchSessionUpload" else { return }
-        Task { await receiveWatchSessionFile(file.fileURL) }
+        do {
+            let data = try Data(contentsOf: file.fileURL)
+            Task { await receiveWatchSessionData(data) }
+        } catch {
+            Task { @MainActor in uploadError = "Could not read watch file: \(error.localizedDescription)" }
+        }
     }
 
     func sessionDidBecomeInactive(_ session: WCSession) {}
@@ -550,41 +633,26 @@ struct LiveChartView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 7, height: 7)
-                    .opacity(0.9)
-                Text("Dynamic Magnitude")
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
+                Circle().fill(Color.green).frame(width: 7, height: 7)
+                Text("Dynamic Magnitude").font(.caption.bold()).foregroundStyle(.secondary)
             }
-
             if points.count < 2 {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color(.systemGray6))
                     .frame(height: 100)
-                    .overlay(
-                        Text("Move to see signal")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    )
+                    .overlay(Text("Move to see signal").font(.caption).foregroundStyle(.tertiary))
             } else {
                 Chart(points) { pt in
-                    LineMark(
-                        x: .value("Time", pt.t),
-                        y: .value("Mag", pt.value)
-                    )
-                    .foregroundStyle(Color.green)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+                    LineMark(x: .value("Time", pt.t), y: .value("Mag", pt.value))
+                        .foregroundStyle(Color.green)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5))
                 }
                 .chartXAxis(.hidden)
                 .chartYAxis {
-                    AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { val in
+                    AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { _ in
                         AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [3]))
                             .foregroundStyle(Color.secondary.opacity(0.3))
-                        AxisValueLabel()
-                            .font(.system(size: 9))
-                            .foregroundStyle(Color.secondary)
+                        AxisValueLabel().font(.system(size: 9)).foregroundStyle(Color.secondary)
                     }
                 }
                 .frame(height: 100)
@@ -603,8 +671,6 @@ struct AccelerometerView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
-
-                    // Live chart — shown during recording
                     if manager.isRecording {
                         LiveChartView(points: manager.liveChartPoints)
                             .padding()
@@ -612,7 +678,6 @@ struct AccelerometerView: View {
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
 
-                    // Raw axis readings
                     VStack(spacing: 8) {
                         Text("Raw Accelerometer").font(.headline)
                         HStack(spacing: 20) {
@@ -630,9 +695,8 @@ struct AccelerometerView: View {
                     .padding()
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
 
-                    // Status messages
                     if manager.isUploading {
-                        HStack { ProgressView(); Text("Uploading session...").foregroundStyle(.secondary) }
+                        HStack { ProgressView(); Text("Uploading...").foregroundStyle(.secondary) }
                     } else if let err = manager.uploadError {
                         HStack {
                             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -645,7 +709,6 @@ struct AccelerometerView: View {
                         }.padding(.horizontal)
                     }
 
-                    // Record button
                     Button(action: {
                         withAnimation { manager.isRecording ? manager.stopUpdates() : manager.startUpdates() }
                     }) {
@@ -653,16 +716,11 @@ struct AccelerometerView: View {
                             manager.isRecording ? "Stop Recording" : "Start Recording",
                             systemImage: manager.isRecording ? "stop.circle.fill" : "record.circle"
                         )
-                        .font(.title3.bold())
-                        .foregroundStyle(.white)
-                        .padding()
+                        .font(.title3.bold()).foregroundStyle(.white).padding()
                         .frame(maxWidth: .infinity)
-                        .background(
-                            manager.isRecording ? Color.red : Color.accentColor,
-                            in: RoundedRectangle(cornerRadius: 14)
-                        )
-                    }
-                    .padding(.horizontal)
+                        .background(manager.isRecording ? Color.red : Color.accentColor,
+                                    in: RoundedRectangle(cornerRadius: 14))
+                    }.padding(.horizontal)
                 }
                 .padding()
             }
@@ -733,7 +791,7 @@ struct SessionRowView: View {
                             .font(.caption.bold())
                             .foregroundStyle(a.isScaleFree == true ? .green : .orange)
                     } else {
-                        Text(a.error != nil ? "No fit" : "Pending").font(.caption).foregroundStyle(.tertiary)
+                        Text(a.error ?? "Pending").font(.caption).foregroundStyle(.tertiary)
                     }
                 } else {
                     Text("No analysis").font(.caption).foregroundStyle(.tertiary)
