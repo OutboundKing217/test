@@ -3,44 +3,30 @@ import CoreMotion
 import Charts
 import WatchConnectivity
 
-private let baseURL = "https://web-production-8cb5b.up.railway.app"
 private let sensorRecorderDuration: TimeInterval = 12 * 60 * 60
 private let recordedSessionStartKey = "recordedSessionStart"
 private let recordedSessionEndKey = "recordedSessionEnd"
 
 // MARK: - Data Models
 
-struct SessionSummary: Codable, Identifiable {
-    let id: String
-    let startedAt: String
-    let durationS: Double
+struct LocalSession: Identifiable {
+    let id = UUID()
+    let fileURL: URL
+    let name: String
+    let date: Date
     let sampleCount: Int
-    let analysis: AnalysisResult?
 
-    enum CodingKeys: String, CodingKey {
-        case id = "session_id"
-        case startedAt = "started_at"
-        case durationS = "duration_s"
-        case sampleCount = "sample_count"
-        case analysis
+    var formattedDate: String {
+        let d = DateFormatter()
+        d.dateStyle = .medium
+        d.timeStyle = .short
+        return d.string(from: date)
     }
-}
 
-struct AnalysisResult: Codable {
-    let tau: Double?
-    let powerLawRange: Double?
-    let goodnessOfFit: Double?
-    let isScaleFree: Bool?
-    let nEvents: Int?
-    let error: String?
-
-    enum CodingKeys: String, CodingKey {
-        case tau
-        case powerLawRange = "power_law_range"
-        case goodnessOfFit = "goodness_of_fit"
-        case isScaleFree = "is_scale_free"
-        case nEvents = "n_events"
-        case error
+    var formattedSize: String {
+        let bytes = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let mb = Double(bytes) / 1_000_000
+        return mb >= 1 ? String(format: "%.1f MB", mb) : String(format: "%.0f KB", Double(bytes) / 1000)
     }
 }
 
@@ -50,20 +36,6 @@ struct SampleEntry: Codable {
     let y: Double
     let z: Double
     let magnitude: Double
-}
-
-struct SessionUploadPayload: Encodable {
-    let userID: String
-    let userName: String
-    let startedAt: String
-    let samples: [SampleEntry]
-
-    enum CodingKeys: String, CodingKey {
-        case userID = "user_id"
-        case userName = "user_name"
-        case startedAt = "started_at"
-        case samples
-    }
 }
 
 struct WatchSessionTransferPayload: Decodable {
@@ -86,7 +58,6 @@ struct LivePoint: Identifiable {
 
 @Observable
 class AccelerometerManager: NSObject, WCSessionDelegate {
-    let userID: String
     var userName: String
 
     var isRecording = false
@@ -99,10 +70,8 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     var liveChartPoints: [LivePoint] = []
     private let maxChartPoints = 150
 
-    var sessions: [SessionSummary] = []
-    var isUploading = false
-    var uploadError: String?
-    var recorderStatus: String?
+    var localSessions: [LocalSession] = []
+    var statusMessage: String?
 
     private let motionManager = CMMotionManager()
     private let sensorRecorder = CMSensorRecorder()
@@ -113,18 +82,10 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     private var recordingStartDate: Date?
     private var startTime: TimeInterval?
 
-    // Live buffer only kept for fallback when CMSensorRecorder unavailable
-    private var buffer: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
-    private let maxBufferSize = 200_000 // ~1.85 hours at 30Hz safety cap
-
     private var gravX: Double = 0
     private var gravY: Double = 0
     private var gravZ: Double = 0
     private let gravAlpha: Double = 0.95
-
-    private var liveSocket: URLSessionWebSocketTask?
-    private var liveSampleBuffer: [SampleEntry] = []
-    private var liveFlushTimer: Timer?
 
     private let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -133,16 +94,10 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     }()
 
     override init() {
-        if let existing = UserDefaults.standard.string(forKey: "userID"), !existing.isEmpty {
-            userID = existing
-        } else {
-            let newID = UUID().uuidString
-            UserDefaults.standard.set(newID, forKey: "userID")
-            userID = newID
-        }
         userName = UserDefaults.standard.string(forKey: "userName") ?? ""
         super.init()
         configureWatchConnectivity()
+        loadLocalSessions()
         restorePendingRecording()
         Task { await recoverFinishedRecordingIfAvailable() }
     }
@@ -158,27 +113,45 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         WCSession.default.activate()
     }
 
-    private func sendUserIDToWatch(_ session: WCSession = .default) {
-        let context = ["userID": userID]
-        try? session.updateApplicationContext(context)
-        if session.isReachable { session.sendMessage(context, replyHandler: nil) }
+    // MARK: - Local File Management
+
+    private var documentsDir: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    func loadLocalSessions() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: documentsDir, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey]) else { return }
+        let csvFiles = files.filter { $0.pathExtension == "csv" }.sorted {
+            let d1 = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let d2 = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return d1 > d2
+        }
+        localSessions = csvFiles.map { url in
+            let date = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            let lines = (try? String(contentsOf: url, encoding: .utf8).components(separatedBy: "\n").count - 2) ?? 0
+            return LocalSession(fileURL: url, name: url.deletingPathExtension().lastPathComponent, date: date, sampleCount: max(0, lines))
+        }
+    }
+
+    func deleteSession(_ session: LocalSession) {
+        try? FileManager.default.removeItem(at: session.fileURL)
+        loadLocalSessions()
     }
 
     // MARK: - Recording
 
     func startUpdates() {
         guard motionManager.isAccelerometerAvailable, !isRecording else { return }
-        buffer = []
         liveChartPoints = []
-        uploadError = nil
+        statusMessage = nil
         recordingStartDate = Date()
         startTime = nil
         elapsedTime = 0
         gravX = 0; gravY = 0; gravZ = 0
         setupCSVFile()
-        startSensorRecording(at: recordingStartDate ?? Date())
+        startSensorRecording(at: recordingStartDate!)
         startLiveUpdates()
-        startLiveStream()
         isRecording = true
     }
 
@@ -187,9 +160,8 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         motionManager.stopAccelerometerUpdates()
         isRecording = false
         closeCSVFile()
-        stopLiveStream()
         finishSensorRecording(at: Date())
-        Task { await self.uploadAfterStop() }
+        Task { await self.processAfterStop() }
     }
 
     private func restorePendingRecording() {
@@ -199,9 +171,8 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         if endDate > Date() {
             isRecording = true
             elapsedTime = Date().timeIntervalSince(startDate)
-            recorderStatus = "Background recording active."
+            statusMessage = "Background recording active."
             startLiveUpdates()
-            startLiveStream()
         }
     }
 
@@ -216,13 +187,13 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 
     private func startSensorRecording(at startDate: Date) {
         guard CMSensorRecorder.isAccelerometerRecordingAvailable() else {
-            recorderStatus = "Background recording not available on this device."
+            statusMessage = "Background recording not available on this device."
             return
         }
         UserDefaults.standard.set(startDate, forKey: recordedSessionStartKey)
         UserDefaults.standard.set(startDate.addingTimeInterval(sensorRecorderDuration), forKey: recordedSessionEndKey)
         sensorRecorder.recordAccelerometer(forDuration: sensorRecorderDuration)
-        recorderStatus = "Background recording enabled."
+        statusMessage = "Background recording enabled."
     }
 
     private func finishSensorRecording(at endDate: Date) {
@@ -255,20 +226,16 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         liveChartPoints.append(LivePoint(t: elapsedTime, value: dynMag))
         if liveChartPoints.count > maxChartPoints { liveChartPoints.removeFirst() }
 
-        // Only keep buffer if sensor recorder unavailable, cap to avoid memory issues
-        if buffer.count < maxBufferSize {
-            buffer.append((t: elapsedTime, x: x, y: y, z: z, magnitude: mag))
-        }
-
         writeSampleToCSV(t: elapsedTime, x: x, y: y, z: z, magnitude: mag)
-        sendLiveSample(SampleEntry(t: elapsedTime, x: x, y: y, z: z, magnitude: mag))
     }
 
+    // MARK: - CSV File
+
     private func setupCSVFile() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let url = docs.appendingPathComponent("accel_\(formatter.string(from: Date())).csv")
+        let filename = "\(userName.isEmpty ? "recording" : userName)_\(formatter.string(from: Date())).csv"
+        let url = documentsDir.appendingPathComponent(filename)
         csvFileURL = url
         try? "elapsedSeconds,x,y,z,magnitude\n".write(to: url, atomically: true, encoding: .utf8)
         fileHandle = try? FileHandle(forWritingTo: url)
@@ -276,7 +243,8 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
     }
 
     private func writeSampleToCSV(t: Double, x: Double, y: Double, z: Double, magnitude: Double) {
-        if let data = "\(t),\(x),\(y),\(z),\(magnitude)\n".data(using: .utf8) {
+        let line = "\(String(format: "%.4f", t)),\(String(format: "%.6f", x)),\(String(format: "%.6f", y)),\(String(format: "%.6f", z)),\(String(format: "%.6f", magnitude))\n"
+        if let data = line.data(using: .utf8) {
             fileHandle?.write(data)
         }
     }
@@ -286,49 +254,17 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         fileHandle = nil
     }
 
-    // MARK: - Live WebSocket
+    // MARK: - Post-recording
 
-    private func startLiveStream() {
-        guard let url = URL(string: "\(baseURL.replacingOccurrences(of: "https://", with: "wss://"))/ws/ingest/\(userID)") else { return }
-        liveSocket = URLSession.shared.webSocketTask(with: url)
-        liveSocket?.resume()
-        liveFlushTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.flushLiveBuffer()
+    private func processAfterStop() async {
+        let didWriteFromRecorder = await writeFromSensorRecorderToCSV()
+        if !didWriteFromRecorder {
+            await MainActor.run {
+                statusMessage = "Recording saved."
+                loadLocalSessions()
+            }
         }
-    }
-
-    private func stopLiveStream() {
-        liveFlushTimer?.invalidate()
-        liveFlushTimer = nil
-        flushLiveBuffer()
-        liveSocket?.cancel(with: .goingAway, reason: nil)
-        liveSocket = nil
-    }
-
-    private func sendLiveSample(_ sample: SampleEntry) {
-        liveSampleBuffer.append(sample)
-    }
-
-    private func flushLiveBuffer() {
-        guard !liveSampleBuffer.isEmpty, let socket = liveSocket else { return }
-        let batch = liveSampleBuffer
-        liveSampleBuffer = []
-        struct Payload: Encodable { let samples: [SampleEntry] }
-        guard let data = try? JSONEncoder().encode(Payload(samples: batch)),
-              let json = String(data: data, encoding: .utf8) else { return }
-        socket.send(.string(json)) { _ in }
-    }
-
-    // MARK: - Upload
-
-    private func uploadAfterStop() async {
-        // Always prefer CMSensorRecorder — it has the full recording even if app was backgrounded
-        let didUploadFromRecorder = await uploadFromSensorRecorderInWindows()
-        if !didUploadFromRecorder {
-            // Fallback: use in-memory buffer (only works if app stayed open)
-            await uploadInChunks(samples: buffer, startedAt: recordingStartDate ?? Date())
-        }
-        buffer = []
+        clearPendingRecordedSession()
     }
 
     private func recoverFinishedRecordingIfAvailable() async {
@@ -339,15 +275,14 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
             motionManager.stopAccelerometerUpdates()
             closeCSVFile()
         }
-        let success = await uploadFromSensorRecorderInWindows()
+        let success = await writeFromSensorRecorderToCSV()
         if !success {
-            await MainActor.run { recorderStatus = "Recorded data not ready yet. Reopen app in a few minutes." }
+            await MainActor.run { statusMessage = "Recorded data not ready yet. Reopen app in a few minutes." }
         }
+        clearPendingRecordedSession()
     }
 
-    /// Streams data from CMSensorRecorder in 30-minute windows.
-    /// Never loads more than 30 minutes into memory — safe for 12-hour recordings.
-    private func uploadFromSensorRecorderInWindows() async -> Bool {
+    private func writeFromSensorRecorderToCSV() async -> Bool {
         guard let startedAt = UserDefaults.standard.object(forKey: recordedSessionStartKey) as? Date,
               let requestedEnd = UserDefaults.standard.object(forKey: recordedSessionEndKey) as? Date else {
             return false
@@ -355,106 +290,43 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         let endedAt = min(requestedEnd, Date())
         guard endedAt > startedAt else { return false }
 
-        let windowDuration: TimeInterval = 1800 // 30 minutes per chunk
-        let totalDuration = endedAt.timeIntervalSince(startedAt)
-        let totalChunks = max(1, Int(ceil(totalDuration / windowDuration)))
-
+        let windowDuration: TimeInterval = 1800
         var windowStart = startedAt
-        var successCount = 0
         var chunkIndex = 0
-
-        await MainActor.run {
-            recorderStatus = "Preparing \(totalChunks) chunk\(totalChunks == 1 ? "" : "s") for upload..."
-        }
+        var successCount = 0
+        let totalChunks = max(1, Int(ceil(endedAt.timeIntervalSince(startedAt) / windowDuration)))
 
         while windowStart < endedAt {
             let windowEnd = min(windowStart.addingTimeInterval(windowDuration), endedAt)
             chunkIndex += 1
 
             await MainActor.run {
-                recorderStatus = "Uploading chunk \(chunkIndex) of \(totalChunks)..."
+                statusMessage = "Saving chunk \(chunkIndex) of \(totalChunks)..."
             }
 
-            // Read only this 30-min window — previous window is released from memory
             if let samples = recordedSamples(from: windowStart, to: windowEnd), !samples.isEmpty {
-                let payloadSamples = samples.map {
-                    SampleEntry(t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude)
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+                let filename = "\(userName.isEmpty ? "recording" : userName)_\(formatter.string(from: windowStart))_chunk\(chunkIndex).csv"
+                let url = documentsDir.appendingPathComponent(filename)
+                var csv = "elapsedSeconds,x,y,z,magnitude\n"
+                for s in samples {
+                    csv += "\(String(format: "%.4f", s.t)),\(String(format: "%.6f", s.x)),\(String(format: "%.6f", s.y)),\(String(format: "%.6f", s.z)),\(String(format: "%.6f", s.magnitude))\n"
                 }
-                let success = await uploadSession(
-                    startedAt: isoFormatter.string(from: windowStart),
-                    samples: payloadSamples
-                )
-                if success { successCount += 1 }
+                try? csv.write(to: url, atomically: true, encoding: .utf8)
+                successCount += 1
             }
 
             windowStart = windowEnd
-
-            // Brief pause between chunks so server isn't overwhelmed
-            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3s
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
 
-        clearPendingRecordedSession()
-        await fetchSessions()
-
         await MainActor.run {
-            if successCount == 0 {
-                recorderStatus = "Upload failed — no data retrieved from sensor recorder."
-            } else if successCount < totalChunks {
-                recorderStatus = "Uploaded \(successCount) of \(totalChunks) chunks. Some failed."
-            } else {
-                recorderStatus = totalChunks > 1 ? "Uploaded \(totalChunks) chunks successfully." : nil
-            }
+            statusMessage = successCount > 0 ? "Saved \(successCount) chunk\(successCount == 1 ? "" : "s") to Files." : nil
+            loadLocalSessions()
         }
 
         return successCount > 0
-    }
-
-    /// Fallback chunked upload from in-memory buffer (used when CMSensorRecorder unavailable)
-    private func uploadInChunks(
-        samples: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)],
-        startedAt: Date
-    ) async {
-        guard !samples.isEmpty else { return }
-
-        let chunkDuration: Double = 1800
-        var chunks: [( [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)], Date )] = []
-        var chunkSamples: [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)] = []
-        var chunkOriginT: Double = samples.first?.t ?? 0
-        var chunkStartDate = startedAt
-
-        for sample in samples {
-            if sample.t - chunkOriginT >= chunkDuration && !chunkSamples.isEmpty {
-                chunks.append((chunkSamples, chunkStartDate))
-                chunkOriginT = sample.t
-                chunkStartDate = startedAt.addingTimeInterval(sample.t)
-                chunkSamples = []
-            }
-            chunkSamples.append(sample)
-        }
-        if !chunkSamples.isEmpty { chunks.append((chunkSamples, chunkStartDate)) }
-
-        let total = chunks.count
-        var successCount = 0
-
-        for (i, (chunk, chunkStart)) in chunks.enumerated() {
-            await MainActor.run { recorderStatus = "Uploading chunk \(i + 1) of \(total)..." }
-            let payloadSamples = chunk.map {
-                SampleEntry(t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude)
-            }
-            let success = await uploadSession(
-                startedAt: isoFormatter.string(from: chunkStart),
-                samples: payloadSamples
-            )
-            if success { successCount += 1 }
-            try? await Task.sleep(nanoseconds: 300_000_000)
-        }
-
-        await fetchSessions()
-        await MainActor.run {
-            recorderStatus = successCount == total
-                ? (total > 1 ? "Uploaded \(total) chunks." : nil)
-                : "Uploaded \(successCount) of \(total) chunks."
-        }
     }
 
     private func recordedSamples(from startedAt: Date, to endedAt: Date) -> [(t: Double, x: Double, y: Double, z: Double, magnitude: Double)]? {
@@ -476,59 +348,27 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
         UserDefaults.standard.removeObject(forKey: recordedSessionEndKey)
     }
 
-    private func uploadSession(startedAt: String, samples: [SampleEntry]) async -> Bool {
-        guard !samples.isEmpty else { return false }
-        await MainActor.run { isUploading = true; uploadError = nil }
-        guard let url = URL(string: "\(baseURL)/sessions") else {
-            await MainActor.run { isUploading = false; uploadError = "Invalid server URL" }
-            return false
-        }
-        let body = SessionUploadPayload(userID: userID, userName: userName, startedAt: startedAt, samples: samples)
-        do {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 120
-            request.httpBody = try JSONEncoder().encode(body)
-            let (data, response) = try await URLSession.shared.data(for: request)
-            if let r = response as? HTTPURLResponse, r.statusCode >= 300 {
-                let msg = String(data: data, encoding: .utf8) ?? "HTTP \(r.statusCode)"
-                await MainActor.run { isUploading = false; uploadError = "Upload failed: \(msg)" }
-                return false
-            }
-            await MainActor.run { isUploading = false }
-            return true
-        } catch {
-            await MainActor.run { isUploading = false; uploadError = "Upload failed: \(error.localizedDescription)" }
-            return false
-        }
-    }
+    // MARK: - Watch Data
 
     private func receiveWatchSessionData(_ data: Data) async {
-        await MainActor.run { isUploading = true; uploadError = nil }
         do {
             let payload = try JSONDecoder().decode(WatchSessionTransferPayload.self, from: data)
-            let samples = payload.samples.map {
-                (t: $0.t, x: $0.x, y: $0.y, z: $0.z, magnitude: $0.magnitude)
-            }
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
             let startDate = isoFormatter.date(from: payload.startedAt) ?? Date()
-            await uploadInChunks(samples: samples, startedAt: startDate)
-        } catch {
-            await MainActor.run {
-                isUploading = false
-                uploadError = "Could not import watch recording: \(error.localizedDescription)"
+            let filename = "watch_\(userName.isEmpty ? "recording" : userName)_\(formatter.string(from: startDate)).csv"
+            let url = documentsDir.appendingPathComponent(filename)
+            var csv = "elapsedSeconds,x,y,z,magnitude\n"
+            for s in payload.samples {
+                csv += "\(String(format: "%.4f", s.t)),\(String(format: "%.6f", s.x)),\(String(format: "%.6f", s.y)),\(String(format: "%.6f", s.z)),\(String(format: "%.6f", s.magnitude))\n"
             }
-        }
-    }
-
-    func fetchSessions() async {
-        guard let url = URL(string: "\(baseURL)/users/\(userID)/sessions") else { return }
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let decoded = try JSONDecoder().decode([SessionSummary].self, from: data)
-            await MainActor.run { sessions = decoded }
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            await MainActor.run {
+                statusMessage = "Watch data saved: \(payload.samples.count) samples."
+                loadLocalSessions()
+            }
         } catch {
-            print("fetchSessions error: \(error)")
+            await MainActor.run { statusMessage = "Could not save watch data: \(error.localizedDescription)" }
         }
     }
 }
@@ -536,17 +376,10 @@ class AccelerometerManager: NSObject, WCSessionDelegate {
 // MARK: - WCSessionDelegate
 
 extension AccelerometerManager {
-    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
-        guard activationState == .activated else { return }
-        sendUserIDToWatch(session)
-    }
+    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {}
 
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
-        if message["request"] as? String == "userID" {
-            replyHandler(["userID": userID])
-        } else {
-            replyHandler([:])
-        }
+        replyHandler([:])
     }
 
     func session(_ session: WCSession, didReceive file: WCSessionFile) {
@@ -555,7 +388,7 @@ extension AccelerometerManager {
             let data = try Data(contentsOf: file.fileURL)
             Task { await receiveWatchSessionData(data) }
         } catch {
-            Task { @MainActor in uploadError = "Could not read watch file: \(error.localizedDescription)" }
+            Task { @MainActor in statusMessage = "Could not read watch file: \(error.localizedDescription)" }
         }
     }
 
@@ -695,14 +528,7 @@ struct AccelerometerView: View {
                     .padding()
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
 
-                    if manager.isUploading {
-                        HStack { ProgressView(); Text("Uploading...").foregroundStyle(.secondary) }
-                    } else if let err = manager.uploadError {
-                        HStack {
-                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                            Text(err).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
-                        }.padding(.horizontal)
-                    } else if let status = manager.recorderStatus {
+                    if let status = manager.statusMessage {
                         HStack {
                             Image(systemName: "recordingtape").foregroundStyle(.secondary)
                             Text(status).font(.caption).foregroundStyle(.secondary)
@@ -739,180 +565,90 @@ struct AccelerometerView: View {
     }
 }
 
-// MARK: - SessionHistoryView
+// MARK: - SessionsView
 
-struct SessionHistoryView: View {
+struct SessionsView: View {
     @Bindable var manager: AccelerometerManager
+    @State private var shareURL: URL?
+    @State private var showShareSheet = false
 
     var body: some View {
         NavigationStack {
             Group {
-                if manager.sessions.isEmpty {
-                    ContentUnavailableView("No Sessions Yet", systemImage: "waveform",
-                        description: Text("Record and upload your first session to see history."))
+                if manager.localSessions.isEmpty {
+                    ContentUnavailableView(
+                        "No Recordings Yet",
+                        systemImage: "waveform",
+                        description: Text("Record a session and it will appear here as a CSV file ready to export.")
+                    )
                 } else {
-                    List(manager.sessions) { session in
-                        NavigationLink(destination: SessionDetailView(session: session)) {
-                            SessionRowView(session: session)
-                        }
-                    }
-                }
-            }
-            .navigationTitle("History")
-            .refreshable { await manager.fetchSessions() }
-        }
-    }
-}
-
-// MARK: - SessionRowView
-
-struct SessionRowView: View {
-    let session: SessionSummary
-
-    private var formattedDate: String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds,
-                           .withDashSeparatorInDate, .withColonSeparatorInTime]
-        guard let date = f.date(from: session.startedAt) else { return session.startedAt }
-        let d = DateFormatter(); d.dateStyle = .medium; d.timeStyle = .short
-        return d.string(from: date)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(formattedDate).font(.subheadline.bold())
-            HStack {
-                Text(String(format: "%.1f s  •  %d samples", session.durationS, session.sampleCount))
-                    .font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                if let a = session.analysis {
-                    if let tau = a.tau {
-                        Label(String(format: "τ=%.2f", tau), systemImage: "chart.line.downtrend.xyaxis")
-                            .font(.caption.bold())
-                            .foregroundStyle(a.isScaleFree == true ? .green : .orange)
-                    } else {
-                        Text(a.error ?? "Pending").font(.caption).foregroundStyle(.tertiary)
-                    }
-                } else {
-                    Text("No analysis").font(.caption).foregroundStyle(.tertiary)
-                }
-            }
-        }.padding(.vertical, 2)
-    }
-}
-
-// MARK: - SessionDetailView
-
-struct SessionDetailView: View {
-    let session: SessionSummary
-
-    private var formattedDate: String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds,
-                           .withDashSeparatorInDate, .withColonSeparatorInTime]
-        guard let date = f.date(from: session.startedAt) else { return session.startedAt }
-        let d = DateFormatter(); d.dateStyle = .long; d.timeStyle = .medium
-        return d.string(from: date)
-    }
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(formattedDate).font(.subheadline).foregroundStyle(.secondary)
-                    Text(String(format: "Duration: %.1f s  •  %d samples", session.durationS, session.sampleCount))
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Divider()
-
-                if let a = session.analysis, a.tau != nil {
-                    HStack {
-                        Image(systemName: a.isScaleFree == true ? "checkmark.seal.fill" : "xmark.seal.fill")
-                            .foregroundStyle(a.isScaleFree == true ? .green : .red).font(.title2)
-                        Text(a.isScaleFree == true ? "Scale-Free Dynamics" : "Not Scale-Free")
-                            .font(.title3.bold()).foregroundStyle(a.isScaleFree == true ? .green : .red)
-                        Spacer()
-                    }
-                    .padding()
-                    .background((a.isScaleFree == true ? Color.green : Color.red).opacity(0.1),
-                                in: RoundedRectangle(cornerRadius: 12))
-
-                    VStack(spacing: 12) {
-                        VStack(spacing: 4) {
-                            Text("Power Law Exponent").font(.subheadline).foregroundStyle(.secondary)
-                            Text(String(format: "τ = %.3f", a.tau!))
-                                .font(.system(size: 48, weight: .bold, design: .rounded))
-                            Text("Ideal range: 1.5 – 2.5").font(.caption).foregroundStyle(.secondary)
-                        }
-                        Divider()
-                        if let gof = a.goodnessOfFit {
-                            VStack(alignment: .leading, spacing: 6) {
+                    List {
+                        ForEach(manager.localSessions) { session in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(session.name)
+                                    .font(.subheadline.bold())
+                                    .lineLimit(1)
                                 HStack {
-                                    Text("Goodness of Fit").font(.subheadline.bold())
+                                    Text(session.formattedDate)
+                                        .font(.caption).foregroundStyle(.secondary)
                                     Spacer()
-                                    Text(String(format: "%.1f%%", gof * 100))
-                                        .font(.subheadline.bold())
-                                        .foregroundStyle(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
+                                    Text("\(session.sampleCount) samples  •  \(session.formattedSize)")
+                                        .font(.caption).foregroundStyle(.secondary)
                                 }
-                                ProgressView(value: gof).tint(gof >= 0.8 ? .green : (gof >= 0.6 ? .yellow : .red))
-                                Text("≥ 80% required for scale-free classification")
-                                    .font(.caption).foregroundStyle(.secondary)
                             }
-                        }
-                        Divider()
-                        HStack(spacing: 20) {
-                            if let plr = a.powerLawRange {
-                                statBox(label: "Fit Range", value: String(format: "%.2f dec", plr))
+                            .padding(.vertical, 2)
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    manager.deleteSession(session)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
                             }
-                            if let n = a.nEvents {
-                                statBox(label: "Events", value: "\(n)")
+                            .swipeActions(edge: .leading) {
+                                Button {
+                                    shareURL = session.fileURL
+                                    showShareSheet = true
+                                } label: {
+                                    Label("Export", systemImage: "square.and.arrow.up")
+                                }
+                                .tint(.blue)
+                            }
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                shareURL = session.fileURL
+                                showShareSheet = true
                             }
                         }
                     }
-                    .padding()
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Interpretation").font(.subheadline.bold())
-                        Text("τ ≈ 1.5    Branching ratio near critical point")
-                        Text("τ ≈ 2.0    Mean-field critical exponent")
-                        Text("τ < 1.5    Sub-critical, reduced complexity")
-                        Text("τ > 2.5    Super-critical, excessive synchrony")
-                        Text("")
-                        Text("Scale-free movement dynamics (goodness of fit ≥ 80%) indicate healthy neurological function.")
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .font(.caption).foregroundStyle(.secondary)
-                    .padding()
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "chart.bar.xaxis").font(.largeTitle).foregroundStyle(.secondary)
-                        Text("No Analysis Available").font(.headline)
-                        if let a = session.analysis, let err = a.error {
-                            Text(err).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        } else {
-                            Text("Too few samples or events detected.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity).padding(40)
                 }
-            }.padding()
+            }
+            .navigationTitle("Recordings")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: { manager.loadLocalSessions() }) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+            }
+            .sheet(isPresented: $showShareSheet) {
+                if let url = shareURL {
+                    ShareSheet(url: url)
+                }
+            }
         }
-        .navigationTitle("Session Detail")
-        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - ShareSheet
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
     }
 
-    private func statBox(label: String, value: String) -> some View {
-        VStack(spacing: 4) {
-            Text(value).font(.title3.bold())
-            Text(label).font(.caption).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity).padding(10)
-        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - ContentView
@@ -927,9 +663,9 @@ struct ContentView: View {
             TabView {
                 AccelerometerView(manager: manager)
                     .tabItem { Label("Record", systemImage: "waveform.circle") }
-                SessionHistoryView(manager: manager)
-                    .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
-                    .onAppear { Task { await manager.fetchSessions() } }
+                SessionsView(manager: manager)
+                    .tabItem { Label("Files", systemImage: "folder") }
+                    .onAppear { manager.loadLocalSessions() }
             }
         }
     }
